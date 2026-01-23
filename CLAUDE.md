@@ -1,6 +1,6 @@
 # CLAUDE.md - Claude Code 项目规范
 
-> 本文件由 Claude Code 自动加载，用于统一协作规范、避免重复踩坑
+> 本文件由 Claude Code 自动加载，用于统一协作规范、避免重复踩坑~
 
 ------
 
