@@ -1,0 +1,1 @@
+a = input('............just wait here:')
