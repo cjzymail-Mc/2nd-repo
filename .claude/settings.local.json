@@ -6,7 +6,9 @@
       "Bash(git push:*)",
       "Bash(gh pr create:*)",
       "Edit(src/*)",
-      "Edit(changelog.md)"
+      "Edit(changelog.md)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh pr view:*)"
     ],
     "deny": [
       "Bash(rm -rf *)",
