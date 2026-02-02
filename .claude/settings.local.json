@@ -1,11 +1,17 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python src/main.py:*)",
-      "Bash(python analyze_template.py:*)",
-      "Bash(python merge_excel.py:*)",
-      "Bash(python merge_excel_v2.py:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(gh pr create:*)",
+      "Edit(src/*)",
+      "Edit(changelog.md)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(git push --force:*)",
+      "Delete(*)"
     ]
   }
 }
