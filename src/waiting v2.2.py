@@ -1,1 +1,0 @@
-a = input('............just wait here: v2')
