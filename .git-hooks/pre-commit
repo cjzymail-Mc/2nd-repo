@@ -1,0 +1,59 @@
+#!/bin/bash
+# Pre-commit Hook - 防止 AI Agent 在主分支直接提交
+
+# 获取当前分支
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+# 主分支列表
+PROTECTED_BRANCHES=("main" "master")
+
+# 检查是否在保护分支
+is_protected=0
+for protected in "${PROTECTED_BRANCHES[@]}"; do
+    if [ "$BRANCH" = "$protected" ]; then
+        is_protected=1
+        break
+    fi
+done
+
+# 如果不在保护分支，直接通过
+if [ $is_protected -eq 0 ]; then
+    exit 0
+fi
+
+# 在保护分支，检查是否是 AI Agent 在操作
+if [ -n "$AGENT_TASK" ] || [ -n "$ORCHESTRATOR_RUNNING" ]; then
+    echo ""
+    echo "========================================"
+    echo "ERROR: AI Agent cannot commit to main branch"
+    echo "========================================"
+    echo ""
+    echo "Current branch: $BRANCH"
+    echo ""
+    echo "Solutions:"
+    echo "  1. Use orchestrator.py (auto-create feature branch):"
+    echo "     python orchestrator.py \"task description\""
+    echo ""
+    echo "  2. Use agent-task.py (auto-create agent branch):"
+    echo "     python agent-task.py tech_lead \"task description\""
+    echo ""
+    echo "  3. Manually create a branch:"
+    echo "     git checkout -b feature/my-task"
+    echo ""
+    exit 1
+fi
+
+# 人类提交，给出警告但允许通过
+echo ""
+echo "WARNING: You are committing to $BRANCH branch"
+echo "         Recommend using feature branch instead"
+echo ""
+read -p "Continue commit to main branch? (y/N) " -n 1 -r
+echo ""
+
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "Commit cancelled"
+    exit 1
+fi
+
+exit 0
