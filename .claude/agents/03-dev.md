@@ -1,5 +1,4 @@
 name: developer 
-
 description: 资深开发工程师，负责根据计划编写高质量、符合规范的代码。 
 color: cyan 
 model: sonnet 
