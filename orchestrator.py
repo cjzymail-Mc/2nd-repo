@@ -19,6 +19,7 @@ import sys
 import time
 import uuid
 import os
+import re
 from pathlib import Path
 from enum import Enum
 from typing import List, Dict, Tuple, Optional
@@ -239,6 +240,129 @@ class AgentScheduler:
     def get_agent_config(self, agent_name: str) -> AgentConfig:
         """获取Agent配置"""
         return self.AGENT_CONFIGS[agent_name]
+
+    def get_all_agent_names(self) -> List[str]:
+        """获取所有可用的 agent 名称"""
+        return list(self.AGENT_CONFIGS.keys())
+
+
+# ============================================================
+# 2.5 ManualTaskParser - 手动任务解析器
+# ============================================================
+
+class ManualTaskParser:
+    """
+    解析手动指定的 agent 任务
+
+    支持语法：
+      - @tech_lead 审核代码                    # 单个 agent
+      - @tech_lead 审核 && @security 安检      # 并行执行
+      - @tech_lead 审核 -> @developer 修复     # 串行执行
+      - @tech_lead 审核 -> (@dev 修复 && @sec 安检) -> @tester 测试  # 混合模式
+    """
+
+    # Agent 别名映射
+    ALIASES = {
+        "arch": "architect",
+        "架构": "architect",
+        "tech": "tech_lead",
+        "技术": "tech_lead",
+        "dev": "developer",
+        "开发": "developer",
+        "test": "tester",
+        "测试": "tester",
+        "opti": "optimizer",
+        "优化": "optimizer",
+        "sec": "security",
+        "安全": "security",
+    }
+
+    def __init__(self):
+        self.scheduler = AgentScheduler()
+        self.valid_agents = self.scheduler.get_all_agent_names()
+
+    def is_manual_mode(self, user_input: str) -> bool:
+        """检测是否是手动指定模式（包含 @agent）"""
+        return bool(re.search(r'@\w+', user_input))
+
+    def resolve_agent_name(self, name: str) -> Optional[str]:
+        """解析 agent 名称（支持别名）"""
+        name = name.lower().strip()
+        if name in self.valid_agents:
+            return name
+        if name in self.ALIASES:
+            return self.ALIASES[name]
+        return None
+
+    def parse(self, user_input: str) -> Tuple[List[List[Tuple[str, str]]], bool]:
+        """
+        解析手动指定的任务
+
+        Args:
+            user_input: 用户输入，如 "@tech_lead 审核代码 -> @developer 修复"
+
+        Returns:
+            (phases, success)
+            phases: [[("agent_name", "task"), ...], ...]  # 每个 phase 包含并行的 agent-task 对
+            success: 解析是否成功
+        """
+        user_input = user_input.strip()
+
+        # 按 -> 分割成多个 phase（串行）
+        phase_strs = re.split(r'\s*->\s*', user_input)
+
+        phases = []
+        for phase_str in phase_strs:
+            phase_str = phase_str.strip()
+
+            # 去除括号
+            if phase_str.startswith('(') and phase_str.endswith(')'):
+                phase_str = phase_str[1:-1].strip()
+
+            # 按 && 分割成并行任务
+            parallel_strs = re.split(r'\s*&&\s*', phase_str)
+
+            phase_tasks = []
+            for task_str in parallel_strs:
+                task_str = task_str.strip()
+
+                # 解析 @agent_name 任务描述
+                match = re.match(r'@(\w+)\s+(.+)$', task_str)
+                if match:
+                    agent_raw, task = match.groups()
+                    agent_name = self.resolve_agent_name(agent_raw)
+
+                    if agent_name is None:
+                        print(f"❌ 未知的 agent: @{agent_raw}")
+                        print(f"   可用的 agents: {', '.join(self.valid_agents)}")
+                        return [], False
+
+                    phase_tasks.append((agent_name, task.strip()))
+                else:
+                    print(f"❌ 无法解析任务: {task_str}")
+                    print(f"   请使用格式: @agent_name 任务描述")
+                    return [], False
+
+            if phase_tasks:
+                phases.append(phase_tasks)
+
+        return phases, True
+
+    def preview(self, phases: List[List[Tuple[str, str]]]) -> None:
+        """预览执行计划"""
+        print(f"\n📋 手动指定模式 - 执行计划：")
+        print(f"   共 {len(phases)} 个阶段")
+
+        for i, phase in enumerate(phases, 1):
+            if len(phase) == 1:
+                agent, task = phase[0]
+                print(f"\n   Phase {i}: @{agent}")
+                print(f"      任务: {task[:50]}{'...' if len(task) > 50 else ''}")
+            else:
+                agents = [f"@{a}" for a, _ in phase]
+                print(f"\n   Phase {i}: {' && '.join(agents)}  (并行)")
+                for agent, task in phase:
+                    print(f"      @{agent}: {task[:40]}{'...' if len(task) > 40 else ''}")
 
 
 # ============================================================
@@ -994,10 +1118,410 @@ class Orchestrator:
         state["total_duration"] = total_duration
         self.state_manager.save_state(state)
 
+    async def execute_manual(
+        self,
+        phases: List[List[Tuple[str, str]]],
+        clean_start: bool = True
+    ) -> bool:
+        """
+        执行手动指定的 agent 任务
+
+        Args:
+            phases: [[("agent_name", "task"), ...], ...]
+            clean_start: 是否清理旧状态
+
+        Returns:
+            True if successful, False if failed
+        """
+        start_time = time.time()
+
+        # 清理旧状态
+        if clean_start:
+            self._cleanup_old_state()
+            print("🧹 已清理旧的状态文件\n")
+
+        # 创建 feature 分支
+        first_task = phases[0][0][1] if phases else "manual-task"
+        feature_branch = self._create_feature_branch(first_task)
+
+        # 初始化状态
+        task_id = str(uuid.uuid4())
+        state = {
+            "task_id": task_id,
+            "mode": "manual",
+            "current_phase": 0,
+            "agents_status": {},
+            "results": {},
+            "total_cost": 0.0,
+            "total_tokens": 0
+        }
+
+        all_results = {}
+
+        # 执行各阶段
+        for phase_idx, phase_tasks in enumerate(phases, 1):
+            agent_names = [agent for agent, _ in phase_tasks]
+            self.monitor.display_phase_start(phase_idx, agent_names)
+
+            # 准备 agent 配置和提示词
+            configs = []
+            prompts = {}
+
+            for agent_name, task in phase_tasks:
+                config = self.scheduler.get_agent_config(agent_name)
+                configs.append(config)
+                prompts[agent_name] = self.task_parser.generate_initial_prompt(task, agent_name=agent_name)
+
+            # 串行 or 并行执行
+            if len(phase_tasks) == 1:
+                # 单个 agent
+                config = configs[0]
+                agent_name = config.name
+                session_id = str(uuid.uuid4())
+
+                # architect 使用交互式模式
+                if agent_name == "architect" and self.interactive_architect:
+                    print(f"\n💡 {self.monitor._get_agent_display_name(agent_name)} 将在交互式模式下运行")
+
+                    result = await asyncio.to_thread(
+                        self.executor.run_agent_interactive,
+                        config,
+                        prompts[agent_name],
+                        session_id
+                    )
+                else:
+                    self.monitor.display_agent_start(agent_name, session_id)
+
+                    result = await self.error_handler.retry_with_backoff(
+                        self.executor.run_agent,
+                        config,
+                        prompts[agent_name],
+                        session_id=session_id
+                    )
+
+                self.monitor.display_agent_complete(result)
+                all_results[agent_name] = result
+
+                if result.status == AgentStatus.FAILED:
+                    print(f"\n❌ {agent_name} 执行失败，终止流程")
+                    self._save_final_state(state, all_results, time.time() - start_time)
+                    return False
+
+            else:
+                # 多个 agent 并行执行
+                session_ids = {config.name: str(uuid.uuid4()) for config in configs}
+
+                for config in configs:
+                    self.monitor.display_agent_start(config.name, session_ids[config.name])
+
+                tasks = [
+                    self.error_handler.retry_with_backoff(
+                        self.executor.run_agent,
+                        config,
+                        prompts[config.name],
+                        session_id=session_ids[config.name]
+                    )
+                    for config in configs
+                ]
+                results = await asyncio.gather(*tasks)
+
+                for result in results:
+                    self.monitor.display_agent_complete(result)
+                    all_results[result.agent_name] = result
+
+                if any(r.status == AgentStatus.FAILED for r in results):
+                    failed = [r.agent_name for r in results if r.status == AgentStatus.FAILED]
+                    print(f"\n❌ 以下 agents 执行失败: {', '.join(failed)}")
+                    self._save_final_state(state, all_results, time.time() - start_time)
+                    return False
+
+            # 更新状态
+            state["current_phase"] = phase_idx
+            for name, result in all_results.items():
+                state["agents_status"][name] = result.status.value
+                result_dict = asdict(result)
+                result_dict["status"] = result.status.value
+                state["results"][name] = result_dict
+            self.state_manager.save_state(state)
+
+        # 显示汇总
+        total_duration = time.time() - start_time
+        self.monitor.display_summary(all_results, total_duration)
+        self._save_final_state(state, all_results, total_duration)
+
+        # 提示合并
+        if feature_branch:
+            print(f"\n{'='*60}")
+            print(f"✅ 手动任务完成！当前在分支: {feature_branch}")
+            print(f"{'='*60}")
+            print(f"下一步：git add . && git commit -m \"完成手动任务\"")
+            print(f"{'='*60}\n")
+
+        return True
+
 
 # ============================================================
 # CLI接口
 # ============================================================
+
+def interactive_mode(project_root: Path):
+    """交互式 CLI 模式"""
+    print("""
+╔════════════════════════════════════════════════════════════╗
+║       🚀 Orchestrator - 多Agent智能调度系统                 ║
+║                                                            ║
+║  自动规划: 描述需求，系统自动调度多个 Agent 协作完成         ║
+║  手动指定: @agent 任务 -> @agent 任务 (串行/并行)           ║
+║  输入 help 查看帮助，agents 查看可用 agent                  ║
+╚════════════════════════════════════════════════════════════╝
+""")
+
+    # 默认配置
+    config = {
+        'max_budget': 10.0,
+        'max_retries': 3,
+        'verbose': False,
+        'auto_architect': False
+    }
+
+    while True:
+        try:
+            user_input = input("\n💬 有什么可以帮您？\n> ").strip()
+
+            if not user_input:
+                continue
+
+            cmd_lower = user_input.lower()
+
+            # 特殊命令
+            if cmd_lower in ['exit', 'quit', 'q', '退出']:
+                print("\n👋 再见！")
+                break
+
+            if cmd_lower in ['help', '?', '帮助']:
+                print("""
+📖 使用帮助
+============================================================
+
+【自动规划模式】直接描述需求：
+  帮我写一个网页版的赛车游戏
+  修复 src/main.py 中的登录 bug
+
+【手动指定模式】使用 @agent 语法：
+  @tech_lead 审核代码                    # 单个 agent
+  @tech_lead 审核 && @security 安检      # 并行执行
+  @tech_lead 审核 -> @developer 修复     # 串行执行
+  @tech 审核 -> (@dev 修复 && @sec 安检) # 混合模式
+
+特殊命令：
+  help, ?       - 显示帮助
+  agents        - 查看可用 agent 和别名
+  config        - 查看/修改配置
+  resume        - 恢复上次中断的任务
+  status        - 查看当前状态
+  exit, quit    - 退出程序
+
+配置选项（在需求后添加）：
+  --budget N    - 设置预算（USD）
+  --auto        - 跳过交互式规划
+  --verbose     - 详细日志
+============================================================
+""")
+                continue
+
+            if cmd_lower in ['agents', 'agent', '列表']:
+                print("""
+📋 可用的 Agents：
+============================================================
+  @architect  (别名: @arch, @架构)    - 系统架构师
+  @tech_lead  (别名: @tech, @技术)    - 技术负责人
+  @developer  (别名: @dev, @开发)     - 开发工程师
+  @tester     (别名: @test, @测试)    - 测试工程师
+  @optimizer  (别名: @opti, @优化)    - 优化专家
+  @security   (别名: @sec, @安全)     - 安全专家
+
+语法说明：
+  ->   串行执行（前一个完成后执行下一个）
+  &&   并行执行（同时执行）
+  ()   分组（用于混合模式）
+
+示例：
+  @tech_lead 审核代码 -> @developer 根据建议修复
+  @tester 测试 && @security 安全检查
+============================================================
+""")
+                continue
+
+            if cmd_lower == 'config':
+                print(f"\n⚙️ 当前配置：")
+                print(f"   预算上限: ${config['max_budget']}")
+                print(f"   重试次数: {config['max_retries']}")
+                print(f"   详细日志: {'是' if config['verbose'] else '否'}")
+                print(f"   自动规划: {'是' if config['auto_architect'] else '否（交互式）'}")
+                print(f"\n修改配置：config budget 20 / config verbose on")
+                continue
+
+            if cmd_lower.startswith('config '):
+                parts = cmd_lower.split()
+                if len(parts) >= 3:
+                    key, value = parts[1], parts[2]
+                    if key == 'budget':
+                        config['max_budget'] = float(value)
+                        print(f"✅ 预算设置为 ${config['max_budget']}")
+                    elif key == 'verbose':
+                        config['verbose'] = value in ['on', 'true', '1', '是']
+                        print(f"✅ 详细日志: {'开启' if config['verbose'] else '关闭'}")
+                    elif key == 'auto':
+                        config['auto_architect'] = value in ['on', 'true', '1', '是']
+                        print(f"✅ 自动规划: {'开启' if config['auto_architect'] else '关闭'}")
+                continue
+
+            if cmd_lower == 'resume':
+                state_file = project_root / ".claude" / "state.json"
+                if state_file.exists():
+                    with open(state_file, 'r', encoding='utf-8') as f:
+                        state = json.load(f)
+                    print(f"📂 找到中断的任务: {state.get('user_request', '未知')}")
+                    confirm = input("是否恢复？[Y/n] ").strip().lower()
+                    if confirm not in ['n', 'no', '否']:
+                        user_input = state['user_request']
+                        # 继续执行
+                    else:
+                        continue
+                else:
+                    print("❌ 没有找到可恢复的任务")
+                    continue
+
+            if cmd_lower == 'status':
+                state_file = project_root / ".claude" / "state.json"
+                if state_file.exists():
+                    with open(state_file, 'r', encoding='utf-8') as f:
+                        state = json.load(f)
+                    print(f"\n📊 任务状态：")
+                    print(f"   任务: {state.get('user_request', '未知')[:50]}")
+                    print(f"   复杂度: {state.get('complexity', '未知')}")
+                    print(f"   当前阶段: {state.get('current_phase', 0)}")
+                    print(f"   总成本: ${state.get('total_cost', 0):.4f}")
+                else:
+                    print("📊 当前没有进行中的任务")
+                continue
+
+            if cmd_lower == 'clear':
+                import os
+                os.system('cls' if os.name == 'nt' else 'clear')
+                continue
+
+            # 解析命令行选项
+            max_budget = config['max_budget']
+            auto_architect = config['auto_architect']
+            verbose = config['verbose']
+
+            if '--budget' in user_input:
+                import re
+                match = re.search(r'--budget\s+(\d+(?:\.\d+)?)', user_input)
+                if match:
+                    max_budget = float(match.group(1))
+                user_input = re.sub(r'--budget\s+\d+(?:\.\d+)?', '', user_input).strip()
+
+            if '--auto' in user_input:
+                auto_architect = True
+                user_input = user_input.replace('--auto', '').strip()
+
+            if '--verbose' in user_input:
+                verbose = True
+                user_input = user_input.replace('--verbose', '').strip()
+
+            if not user_input:
+                continue
+
+            # 检测是否是手动指定模式
+            manual_parser = ManualTaskParser()
+
+            if manual_parser.is_manual_mode(user_input):
+                # ========== 手动指定模式 ==========
+                phases, success = manual_parser.parse(user_input)
+
+                if not success:
+                    continue
+
+                # 预览执行计划
+                manual_parser.preview(phases)
+                print(f"   预算上限: ${max_budget}")
+
+                confirm = input("\n确认执行？[Y/n] ").strip().lower()
+                if confirm in ['n', 'no', '否']:
+                    print("已取消")
+                    continue
+
+                # 创建 orchestrator 并执行手动任务
+                orchestrator = Orchestrator(
+                    project_root=project_root,
+                    max_budget=max_budget,
+                    max_retries=config['max_retries'],
+                    verbose=verbose,
+                    interactive_architect=not auto_architect
+                )
+
+                success = asyncio.run(orchestrator.execute_manual(phases, clean_start=True))
+
+                if success:
+                    print("\n✅ 手动任务完成！可以继续输入新需求。")
+                else:
+                    print("\n❌ 任务执行失败，请检查错误日志。")
+
+            else:
+                # ========== 自动规划模式 ==========
+                task_parser = TaskParser(project_root)
+                _, complexity = task_parser.parse(user_input)
+
+                scheduler = AgentScheduler()
+                phases = scheduler.plan_execution(complexity)
+                total_agents = sum(len(p) for p in phases)
+
+                print(f"\n📋 自动规划模式 - 任务预览：")
+                print(f"   需求: {user_input[:60]}{'...' if len(user_input) > 60 else ''}")
+                print(f"   复杂度: {complexity.value}")
+                print(f"   执行阶段: {len(phases)} 个阶段，{total_agents} 个 Agent")
+                print(f"   预算上限: ${max_budget}")
+                print(f"   规划模式: {'自动' if auto_architect else '交互式'}")
+
+                # 显示执行计划
+                print(f"\n   执行计划：")
+                for i, phase_agents in enumerate(phases, 1):
+                    agent_names = ', '.join(phase_agents)
+                    print(f"     Phase {i}: {agent_names}")
+
+                confirm = input("\n确认执行？[Y/n] ").strip().lower()
+                if confirm in ['n', 'no', '否']:
+                    print("已取消")
+                    continue
+
+                # 创建 orchestrator 并执行
+                orchestrator = Orchestrator(
+                    project_root=project_root,
+                    max_budget=max_budget,
+                    max_retries=config['max_retries'],
+                    verbose=verbose,
+                    interactive_architect=not auto_architect
+                )
+
+                success = asyncio.run(orchestrator.execute(user_input, clean_start=True))
+
+                if success:
+                    print("\n✅ 任务完成！可以继续输入新需求。")
+                else:
+                    print("\n❌ 任务执行失败，请检查错误日志。")
+
+        except KeyboardInterrupt:
+            print("\n\n⚠️ 中断当前任务")
+            continue
+        except EOFError:
+            print("\n\n👋 再见！")
+            break
+        except Exception as e:
+            print(f"\n❌ 错误: {e}")
+            continue
+
 
 def main():
     """CLI入口"""
@@ -1005,17 +1529,17 @@ def main():
         description="Orchestrator - 星型拓扑多Agent并发调度系统",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例:
-  # 简单任务（architect交互式规划）
+交互模式（推荐）：
+  python orchestrator.py
+
+  进入后直接描述需求：
+    帮我写一个网页版的赛车游戏
+    修复 src/main.py 中的登录 bug
+
+传统命令行模式：
   python orchestrator.py "修复src/main.py中的登录bug"
-
-  # 复杂任务（交互式 + 详细日志）
-  python orchestrator.py "帮我写一个网页版的赛车游戏" --max-budget 20.0 --verbose
-
-  # 完全自动化执行（跳过交互）
+  python orchestrator.py "帮我写一个赛车游戏" --max-budget 20.0
   python orchestrator.py "任务描述" --auto-architect
-
-  # 恢复中断任务
   python orchestrator.py --resume
         """
     )
@@ -1023,7 +1547,7 @@ def main():
     parser.add_argument(
         "request",
         nargs="?",
-        help="用户需求描述"
+        help="用户需求描述（不指定则进入交互模式）"
     )
     parser.add_argument(
         "--max-budget",
@@ -1058,6 +1582,11 @@ def main():
     # 获取项目根目录
     project_root = Path.cwd()
 
+    # 如果没有指定需求且不是恢复模式，进入交互模式
+    if not args.request and not args.resume:
+        interactive_mode(project_root)
+        return
+
     # 创建orchestrator实例
     orchestrator = Orchestrator(
         project_root=project_root,
@@ -1077,9 +1606,6 @@ def main():
             print("❌ 未找到可恢复的任务")
             sys.exit(1)
     else:
-        if not args.request:
-            parser.print_help()
-            sys.exit(1)
         user_request = args.request
 
     # 执行
