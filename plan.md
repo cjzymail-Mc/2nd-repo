@@ -6,58 +6,85 @@
 
 ---
 
-## 代码库分析
+## 第二轮工作发现（重要更新）
 
-### 项目结构
-```
-2nd-repo/
-├── src/
-│   └── 6-agents.py        # 主程序 (2113行)
-├── .claude/
-│   ├── agents/            # 6个Agent配置文件
-│   │   ├── 01-arch.md     # Architect (263行，完整)
-│   │   ├── 02-tech.md     # Tech Lead (17行，不完整)
-│   │   ├── 03-dev.md      # Developer (18行，不完整)
-│   │   ├── 04-test.md     # Tester (18行，不完整)
-│   │   ├── 05-opti.md     # Optimizer (17行，不完整)
-│   │   └── 06-secu.md     # Security (17行，不完整)
-│   ├── state.json         # 状态持久化
-│   └── branch_counter.txt # 分支计数器
-├── mc-dir-v1.py           # 旧版本
-├── mc-dir-v2.py           # 旧版本
-└── task2.md               # 任务描述
-```
+### ✅ Agent 配置文件状态（重大修正）
 
-### 技术栈
-- **语言**: Python 3.x
-- **异步**: asyncio
-- **CLI**: argparse + subprocess (调用 claude CLI)
-- **依赖**: 纯标准库，无第三方依赖
+**初始评估"不完整"是误判！所有6个文件都是完整的高质量配置：**
+
+| 文件 | 行数 | 状态 | 评级 |
+|------|------|------|------|
+| 01-arch.md | 277 | ✅ 完整 | ★★★★★ |
+| 02-tech.md | 199 | ✅ 完整 | ★★★★★ |
+| 03-dev.md | 282 | ✅ 完整 | ★★★★★ |
+| 04-test.md | 355 | ✅ 完整 | ★★★★★ |
+| 05-opti.md | 327 | ✅ 完整 | ★★★★★ |
+| 06-secu.md | 384 | ✅ 完整 | ★★★★★ |
+
+**结论：无需修改 Agent 配置文件**
 
 ---
 
-## 发现的问题
+### ✅ 测试现状
 
-### 🔴 P0 - 严重问题（必须修复）
+**已有测试（32个，全部通过）：**
+- `tests/conftest.py` - pytest 配置和 fixtures（78行）
+- `tests/unit/test_manual_parser.py` - ManualTaskParser 单元测试（14个）
+- `tests/unit/test_stream_json.py` - stream-json 解析测试（11个）
+- `tests/unit/test_task_parser.py` - TaskParser 单元测试（7个）
 
-| # | 问题 | 位置 | 影响 |
+**当前覆盖率：约 30%**
+
+**已覆盖：**
+- ✅ 中文别名识别（@架构、@开发 等）
+- ✅ stream-json 多格式解析
+- ✅ 任务复杂度判断
+
+**未覆盖（关键缺失）：**
+- ❌ AgentExecutor.run_agent（核心执行）
+- ❌ Orchestrator 主控流程
+- ❌ StateManager（状态管理）
+- ❌ ErrorHandler（错误恢复）
+- ❌ 异步/并发测试
+- ❌ 异常场景测试
+
+---
+
+## 问题清单（已验证 + 新发现）
+
+### 🔴 P0 - 必须修复
+
+| # | 问题 | 位置 | 说明 |
 |---|------|------|------|
-| 1 | Agent配置文件内容不完整 | 02~06-*.md | Agent缺乏详细工作指导 |
-| 2 | 中文别名正则不支持 | 行 292, 336 | `@架构` `@开发` 等无法使用 |
+| ~~1~~ | ~~Agent配置文件不完整~~ | - | ✅ 已验证完整，无需修复 |
+| ~~2~~ | ~~中文别名正则不支持~~ | - | ✅ 已验证支持，代码正确 |
 
-### 🟡 P1 - 高优先级
+### 🟡 P1 - 高优先级（需修复）
 
-| # | 问题 | 位置 | 影响 |
+| # | 问题 | 位置 | 说明 |
 |---|------|------|------|
-| 3 | stream-json解析脆弱 | 行 723-774 | 成本/tokens统计可能失败 |
-| 4 | 并发无速率限制 | 行 1235-1244 | 可能触发API限流 |
+| 3 | stream-json `or` 操作符缺陷 | 行 771 | `0 or value` 返回 value 而非 0 |
+| 4 | stdout/stderr 解码无容错 | 行 562, 580 | 无效UTF-8会抛异常 |
+| 5 | 分支编号创建竞态窗口 | 行 1072-1073 | 文件创建在加锁之前 |
+| 6 | 分支编号降级方案精度过低 | 行 1100 | 秒级时间戳可能重复 |
 
 ### 🟢 P2 - 中等优先级
 
-| # | 问题 | 位置 | 影响 |
+| # | 问题 | 位置 | 说明 |
 |---|------|------|------|
-| 5 | 分支编号竞态条件 | 行 1025-1049 | 并发时可能创建重名分支 |
-| 6 | PLAN.md读取无容错 | 行 1675-1680 | 文件缺失时报错不友好 |
+| 7 | 异常处理过于宽泛 | 行 1048, 1057 | `except Exception: pass` 吃掉错误 |
+| 8 | 状态保存潜在竞态 | 行 833-838 | temp文件名可能冲突 |
+| 9 | 子进程未等待真正终止 | 行 540 | `process.kill()` 后无 `await wait()` |
+| 10 | phase索引计算脆弱 | 行 1437 | 硬编码依赖 agent 列表长度 |
+| 11 | 文件权限异常捕获不完整 | 多处 | 只捕获 FileNotFoundError |
+
+### 🔵 P3 - 低优先级
+
+| # | 问题 | 位置 | 说明 |
+|---|------|------|------|
+| 12 | 进度指示器任务泄漏风险 | 行 529-551 | cancel 后未等待清理 |
+| 13 | 重试日志消息时序不合理 | 行 886 | "X秒后重试"显示在等待前 |
+| 14 | PLAN.md 空白检查不够 | 行 1764 | 只检查空白，不检查有效内容 |
 
 ---
 
@@ -67,177 +94,206 @@
 
 | 文件 | 操作 | 说明 |
 |------|------|------|
-| `src/6-agents.py` | 修改 | 修复 4 处 bug |
-| `.claude/agents/02-tech.md` | 修改 | 扩展到 ~100 行 |
-| `.claude/agents/03-dev.md` | 修改 | 扩展到 ~100 行 |
-| `.claude/agents/04-test.md` | 修改 | 扩展到 ~100 行 |
-| `.claude/agents/05-opti.md` | 修改 | 扩展到 ~100 行 |
-| `.claude/agents/06-secu.md` | 修改 | 扩展到 ~100 行 |
-| `tests/conftest.py` | 新增 | 测试配置和fixtures |
-| `tests/unit/test_*.py` | 新增 | 单元测试文件 |
-
-### 无依赖变更
-代码使用纯标准库，无需安装额外依赖。测试需要 `pytest pytest-asyncio`。
+| `src/6-agents.py` | 修改 | 修复 P1-P2 共 9 处 bug |
+| ~~`.claude/agents/02-06*.md`~~ | ~~修改~~ | ✅ 无需修改 |
+| `tests/unit/test_executor.py` | 新增 | AgentExecutor 测试 |
+| `tests/unit/test_state.py` | 新增 | StateManager 测试 |
+| `tests/integration/test_orchestrator.py` | 新增 | 集成测试 |
 
 ---
 
 ## 分步实施路径
 
-### Step 1: 修复中文别名正则 (P0)
+### Step 1: 修复 stream-json `or` 操作符缺陷 (P1)
 
-**文件**: `src/6-agents.py`
+**文件**: `src/6-agents.py`，行 771
 
-**修改 1 - 行 292** (`is_manual_mode` 方法):
 ```python
 # 原代码
-return bool(re.search(r'@\w+', user_input))
+cost = data.get('cost_usd', 0) or data.get('cost', 0)
 
-# 修改为
-return bool(re.search(r'@[\w\u4e00-\u9fff]+', user_input))
+# 修改为（正确处理 0 值）
+cost = data.get('cost_usd') if 'cost_usd' in data else data.get('cost', 0)
 ```
 
-**修改 2 - 行 336** (`_parse_single_task` 方法):
+### Step 2: 修复 stdout/stderr 解码无容错 (P1)
+
+**文件**: `src/6-agents.py`，行 562, 580
+
 ```python
 # 原代码
-match = re.match(r'@(\w+)\s+(.+)$', task_str)
+cost, tokens = self._parse_stream_json(stdout.decode('utf-8'))
+error_message=stderr.decode('utf-8') if process.returncode != 0 else None
 
 # 修改为
-match = re.match(r'@([\w\u4e00-\u9fff]+)\s+(.+)$', task_str)
+cost, tokens = self._parse_stream_json(stdout.decode('utf-8', errors='replace'))
+error_message=stderr.decode('utf-8', errors='replace') if process.returncode != 0 else None
 ```
 
-### Step 2: 增强 stream-json 解析 (P1)
+### Step 3: 修复分支编号竞态窗口 (P1)
 
-**文件**: `src/6-agents.py`，行 723-774
+**文件**: `src/6-agents.py`，行 1072-1073
 
-增强 `_parse_stream_json` 方法：
-- 添加多种 JSON 结构的支持
-- 添加 `cost_usd` 字段兼容
-- 添加 `usage.input_tokens + output_tokens` 计算
-- 添加空值和异常保护
-
-### Step 3: 添加并发限制 (P1)
-
-**文件**: `src/6-agents.py`
-
-在 `AgentExecutor.__init__` 中添加:
 ```python
-self._semaphore = asyncio.Semaphore(max_concurrent)  # 默认 2-3
+# 原代码（竞态窗口）
+if not counter_file.exists():
+    counter_file.write_text("0", encoding='utf-8')
+
+with open(counter_file, 'r+', encoding='utf-8') as f:
+    # 加锁...
+
+# 修改为（文件创建也在锁内）
+with open(counter_file, 'a+', encoding='utf-8') as f:
+    # 先加锁
+    if sys.platform == 'win32':
+        import msvcrt
+        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+    # 再读写
+    f.seek(0)
+    content = f.read().strip()
+    if not content:
+        counter = 0
+    else:
+        counter = int(content)
+    # ...
 ```
 
-在 `run_agent` 方法中使用:
+### Step 4: 修复分支编号降级方案精度 (P1)
+
+**文件**: `src/6-agents.py`，行 1100
+
 ```python
-async with self._semaphore:
-    # 原有执行逻辑
+# 原代码（秒级精度）
+counter = int(time.time()) % 1000
+
+# 修改为（毫秒级 + 随机数）
+import random
+counter = int(time.time() * 1000) % 100000 + random.randint(0, 99)
 ```
 
-### Step 4: 修复分支编号竞态 (P2)
+### Step 5: 修复异常处理过于宽泛 (P2)
 
-**文件**: `src/6-agents.py`，行 1025-1049
+**文件**: `src/6-agents.py`，行 1048, 1057
 
-使用 Windows 兼容的文件锁:
 ```python
-import msvcrt  # Windows
-# 或 fcntl (Unix)
+# 原代码
+except Exception:
+    pass
+
+# 修改为
+except (OSError, FileNotFoundError):
+    pass
 ```
 
-### Step 5: 完善 Agent 配置文件 (P0)
+### Step 6: 修复子进程未等待终止 (P2)
 
-**参考模板**: `01-arch.md` (263行)
+**文件**: `src/6-agents.py`，行 540
 
-每个文件需包含:
-1. YAML frontmatter (name, description, model, tools)
-2. 角色定义
-3. 核心职责（详细）
-4. 工作流程（分步骤）
-5. 约束条件（DO / DO NOT）
-6. 输出文件格式示例
+```python
+# 原代码
+process.kill()
+return ExecutionResult(...)
 
-**02-tech.md** 扩展内容:
-- 计划审核标准
-- 任务分解方法
-- 代码规范检查清单
+# 修改为
+process.kill()
+try:
+    await asyncio.wait_for(process.wait(), timeout=5.0)
+except asyncio.TimeoutError:
+    pass  # 强制终止后仍超时，忽略
+return ExecutionResult(...)
+```
 
-**03-dev.md** 扩展内容:
-- 编码规范
-- PROGRESS.md 更新格式
-- 错误处理要求
+### Step 7: 修复文件权限异常捕获 (P2)
 
-**04-test.md** 扩展内容:
-- 测试策略（单元/集成/E2E）
-- BUG_REPORT.md 格式模板
-- 测试用例编写规范
+**文件**: `src/6-agents.py`，多处
 
-**05-opti.md** 扩展内容:
-- 优化优先级标准
-- 重构原则
-- 性能基准要求
+```python
+# 原代码
+except FileNotFoundError:
+    ...
 
-**06-secu.md** 扩展内容:
-- OWASP Top 10 检查清单
-- SECURITY_AUDIT.md 格式
-- 常见漏洞检测方法
+# 修改为
+except (FileNotFoundError, PermissionError, IOError):
+    ...
+```
 
-### Step 6: 编写测试用例
+### Step 8: 补充核心测试用例
 
-**创建文件**:
-- `tests/conftest.py` - 共享 fixtures
-- `tests/unit/test_manual_parser.py` - 中文别名测试
-- `tests/unit/test_stream_json.py` - JSON解析测试
-- `tests/unit/test_task_parser.py` - 任务解析测试
+**新建文件**:
+- `tests/unit/test_executor.py` - AgentExecutor 测试（mock subprocess）
+- `tests/unit/test_state.py` - StateManager 测试
+- `tests/integration/test_orchestrator.py` - 集成测试
+
+**测试重点**:
+1. AgentExecutor.run_agent（mock 子进程）
+2. StateManager save/load/clear
+3. ErrorHandler.retry_with_backoff（重试机制）
+4. 超时、文件缺失等异常场景
 
 ---
 
 ## 验证方法
 
-### 1. 中文别名验证
-```bash
-python -c "
-from src.six_agents import ManualTaskParser
-p = ManualTaskParser()
-print(p.is_manual_mode('@架构 分析需求'))  # 应输出 True
-"
-```
-
-### 2. 单元测试验证
+### 1. 单元测试
 ```bash
 pip install pytest pytest-asyncio
 pytest tests/unit -v
 ```
 
-### 3. 端到端验证
+### 2. 集成测试
 ```bash
-# 测试全自动模式
-python src/6-agents.py task2.md --auto-architect --max-budget 0.5
-
-# 测试手动模式
-python src/6-agents.py
-# 输入: @architect 分析代码结构
+pytest tests/integration -v
 ```
 
-### 4. 恢复机制验证
+### 3. 端到端验证
 ```bash
-# 启动任务后 Ctrl+C 中断
-python src/6-agents.py task2.md --auto-architect
+# 全自动模式
+python src/6-agents.py task2.md --auto-architect --max-budget 0.5
 
-# 恢复执行
+# 手动模式（中文别名）
+python src/6-agents.py
+# 输入: @架构 分析代码结构
+
+# 恢复机制
 python src/6-agents.py --resume
+```
+
+### 4. 代码静态检查
+```bash
+# 检查语法错误
+python -m py_compile src/6-agents.py
+
+# 可选：类型检查
+mypy src/6-agents.py --ignore-missing-imports
 ```
 
 ---
 
 ## 风险和注意事项
 
-1. **Windows 兼容性**: 文件锁使用 `msvcrt` 而非 `fcntl`
-2. **路径规范**: 始终使用正斜杠 `/`，遵循 CLAUDE.md 规范
-3. **测试依赖**: 需要安装 `pytest pytest-asyncio`
-4. **Claude CLI**: 端到端测试需要 claude CLI 可用且有额度
+1. **Windows 兼容性**: 文件锁使用 `msvcrt`
+2. **路径规范**: 始终使用正斜杠 `/`
+3. **测试依赖**: 需要 `pytest pytest-asyncio`
+4. **Claude CLI**: 端到端测试需要 claude CLI 可用
 5. **Git 分支**: 测试时注意当前分支状态
 
 ---
 
 ## 预期成果
 
-1. 6-agents.py 所有已知 bug 修复
-2. 5 个 Agent 配置文件完善（各约 100 行）
-3. 完整的单元测试套件（覆盖率 > 80%）
-4. 系统可正常执行三种模式（全自动/半自动/手动）
+1. ✅ 9 处已确认 bug 全部修复
+2. ✅ 新增 3 个测试文件，覆盖率提升至 >60%
+3. ✅ 系统可正常执行三种模式（全自动/半自动/手动）
+4. ✅ 异常场景有合理的容错和恢复机制
+
+---
+
+## 工作量估算
+
+| 任务 | 工作量 |
+|------|--------|
+| P1 bug 修复（4处） | 约 1 小时 |
+| P2 bug 修复（5处） | 约 1 小时 |
+| 核心测试用例补充 | 约 2-3 小时 |
+| 端到端验证 | 约 1 小时 |
+| **总计** | **约 5-6 小时** |
