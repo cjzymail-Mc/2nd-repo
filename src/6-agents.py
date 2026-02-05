@@ -1205,6 +1205,132 @@ class Orchestrator:
             print(f"⚠️ Git 操作失败: {e}")
             return None
 
+    def _get_current_branch(self) -> Optional[str]:
+        """获取当前 git 分支名"""
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                encoding='utf-8'
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+            return None
+        except Exception:
+            return None
+
+    def _create_agent_subbranch(self, parent_branch: str, agent_name: str) -> Optional[str]:
+        """
+        为特定 agent 创建隔离子分支
+
+        Returns:
+            子分支名（成功）或 None（失败）
+        """
+        try:
+            subbranch_name = f"{parent_branch}-{agent_name}-{str(uuid.uuid4())[:8]}"
+
+            result = subprocess.run(
+                ["git", "checkout", "-b", subbranch_name],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                encoding='utf-8'
+            )
+
+            if result.returncode == 0:
+                return subbranch_name
+            else:
+                print(f"⚠️ 创建子分支失败: {result.stderr}")
+                return None
+
+        except Exception as e:
+            print(f"⚠️ 创建子分支异常: {e}")
+            return None
+
+    def _switch_to_branch(self, branch_name: str) -> bool:
+        """切换到指定分支"""
+        try:
+            result = subprocess.run(
+                ["git", "checkout", branch_name],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                encoding='utf-8'
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _commit_agent_changes(self, agent_name: str, task_desc: str) -> bool:
+        """提交 agent 的所有更改"""
+        try:
+            subprocess.run(
+                ["git", "add", "-A"],
+                cwd=str(self.project_root),
+                capture_output=True
+            )
+
+            commit_msg = f"[{agent_name}] {task_desc[:50]}"
+            result = subprocess.run(
+                ["git", "commit", "-m", commit_msg, "--allow-empty"],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                encoding='utf-8'
+            )
+
+            return result.returncode == 0
+
+        except Exception:
+            return False
+
+    def _merge_subbranch(self, subbranch: str, target_branch: str) -> Tuple[bool, Optional[str]]:
+        """
+        将子分支合并到目标分支
+
+        Returns:
+            (成功, 冲突信息)
+        """
+        try:
+            if not self._switch_to_branch(target_branch):
+                return False, "无法切换到目标分支"
+
+            result = subprocess.run(
+                ["git", "merge", subbranch, "--no-edit"],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                encoding='utf-8'
+            )
+
+            if result.returncode == 0:
+                return True, None
+            else:
+                if "CONFLICT" in result.stdout or "conflict" in result.stderr.lower():
+                    subprocess.run(
+                        ["git", "merge", "--abort"],
+                        cwd=str(self.project_root),
+                        capture_output=True
+                    )
+                    return False, f"合并冲突: {result.stdout}"
+                return False, result.stderr
+
+        except Exception as e:
+            return False, str(e)
+
+    def _cleanup_subbranch(self, branch_name: str) -> None:
+        """删除子分支（合并成功后）"""
+        try:
+            subprocess.run(
+                ["git", "branch", "-d", branch_name],
+                cwd=str(self.project_root),
+                capture_output=True
+            )
+        except Exception:
+            pass
+
     async def execute(
         self,
         user_request: str,
@@ -1357,20 +1483,43 @@ class Orchestrator:
                     return False
 
             else:
-                # 多个agents：并行执行（每个都带重试）
+                # 多个agents：并行执行 - 使用子分支隔离
                 # 为每个agent生成session_id
                 session_ids = {config.name: str(uuid.uuid4()) for config in configs}
+
+                # 记录主分支
+                main_branch = feature_branch if feature_branch else self._get_current_branch()
+                agent_subbranches = {}
 
                 for config in configs:
                     self.monitor.display_agent_start(config.name, session_ids[config.name])
 
-                # 并行执行所有agents（每个独立重试）
-                tasks = [
-                    self.error_handler.retry_with_backoff(
+                # 并行执行（每个 agent 在独立子分支）
+                async def run_agent_isolated(config: AgentConfig, prompt: str, session_id: str) -> ExecutionResult:
+                    # 创建子分支
+                    subbranch = self._create_agent_subbranch(main_branch, config.name)
+                    if subbranch:
+                        agent_subbranches[config.name] = subbranch
+
+                    # 执行 agent
+                    result = await self.error_handler.retry_with_backoff(
                         self.executor.run_agent,
                         config,
+                        prompt,
+                        session_id=session_id
+                    )
+
+                    # 提交更改
+                    if subbranch and result.status == AgentStatus.COMPLETED:
+                        self._commit_agent_changes(config.name, user_request[:50])
+
+                    return result
+
+                tasks = [
+                    run_agent_isolated(
+                        config,
                         prompts[config.name],
-                        session_id=session_ids[config.name]
+                        session_ids[config.name]
                     )
                     for config in configs
                 ]
@@ -1380,6 +1529,30 @@ class Orchestrator:
                 for result in results:
                     self.monitor.display_agent_complete(result)
                     all_results[result.agent_name] = result
+
+                # 合并子分支
+                if all(r.status == AgentStatus.COMPLETED for r in results) and agent_subbranches:
+                    print(f"\n🔀 合并各 agent 的更改...")
+                    merge_failures = []
+
+                    for agent_name, subbranch in agent_subbranches.items():
+                        success, conflict_info = self._merge_subbranch(subbranch, main_branch)
+                        if success:
+                            print(f"  ✅ {agent_name} 的更改已合并")
+                            self._cleanup_subbranch(subbranch)
+                        else:
+                            merge_failures.append((agent_name, conflict_info))
+                            print(f"  ❌ {agent_name} 合并失败: {conflict_info}")
+
+                    if merge_failures:
+                        print(f"\n⚠️ 检测到合并冲突！")
+                        print(f"   以下分支保留供手动处理:")
+                        for agent, _ in merge_failures:
+                            print(f"     - {agent_subbranches.get(agent, 'unknown')}")
+                elif agent_subbranches:
+                    # 有 agent 失败，清理子分支
+                    for subbranch in agent_subbranches.values():
+                        self._cleanup_subbranch(subbranch)
 
                 # 如果任何一个失败，终止执行
                 if any(r.status == AgentStatus.FAILED for r in results):
@@ -1886,8 +2059,9 @@ class Orchestrator:
         # 获取执行计划
         phases = self.scheduler.plan_execution(complexity)
 
-        # 创建 feature 分支
-        feature_branch = self._create_feature_branch(user_request)
+        # 创建 feature 分支（获取首个agent名称）
+        first_agent = phases[0][0] if phases and phases[0] else "arch"
+        feature_branch = self._create_feature_branch(user_request, first_agent)
 
         # 初始化状态
         task_id = str(uuid.uuid4())
@@ -2195,26 +2369,79 @@ class Orchestrator:
                     return False
 
             else:
-                # 多个 agent 并行执行
+                # 多个 agent 并行执行 - 使用子分支隔离
                 session_ids = {config.name: str(uuid.uuid4()) for config in configs}
+
+                # 记录主分支
+                main_branch = feature_branch if feature_branch else self._get_current_branch()
+                agent_subbranches = {}
 
                 for config in configs:
                     self.monitor.display_agent_start(config.name, session_ids[config.name])
 
-                tasks = [
-                    self.error_handler.retry_with_backoff(
+                # 并行执行（每个 agent 在独立子分支）
+                async def run_agent_isolated(config: AgentConfig, prompt: str, session_id: str, task_desc: str) -> ExecutionResult:
+                    # 创建子分支
+                    subbranch = self._create_agent_subbranch(main_branch, config.name)
+                    if subbranch:
+                        agent_subbranches[config.name] = subbranch
+
+                    # 执行 agent
+                    result = await self.error_handler.retry_with_backoff(
                         self.executor.run_agent,
                         config,
+                        prompt,
+                        session_id=session_id
+                    )
+
+                    # 提交更改
+                    if subbranch and result.status == AgentStatus.COMPLETED:
+                        self._commit_agent_changes(config.name, task_desc)
+
+                    return result
+
+                # 获取每个 agent 对应的任务描述
+                agent_task_map = {agent: task for agent, task in phase_tasks}
+
+                tasks = [
+                    run_agent_isolated(
+                        config,
                         prompts[config.name],
-                        session_id=session_ids[config.name]
+                        session_ids[config.name],
+                        agent_task_map.get(config.name, "parallel-task")
                     )
                     for config in configs
                 ]
                 results = await asyncio.gather(*tasks)
 
+                # 显示结果
                 for result in results:
                     self.monitor.display_agent_complete(result)
                     all_results[result.agent_name] = result
+
+                # 合并子分支
+                if all(r.status == AgentStatus.COMPLETED for r in results) and agent_subbranches:
+                    print(f"\n🔀 合并各 agent 的更改...")
+                    merge_failures = []
+
+                    for agent_name, subbranch in agent_subbranches.items():
+                        success, conflict_info = self._merge_subbranch(subbranch, main_branch)
+                        if success:
+                            print(f"  ✅ {agent_name} 的更改已合并")
+                            self._cleanup_subbranch(subbranch)
+                        else:
+                            merge_failures.append((agent_name, conflict_info))
+                            print(f"  ❌ {agent_name} 合并失败: {conflict_info}")
+
+                    if merge_failures:
+                        print(f"\n⚠️ 检测到合并冲突！")
+                        print(f"   以下分支保留供手动处理:")
+                        for agent, _ in merge_failures:
+                            print(f"     - {agent_subbranches.get(agent, 'unknown')}")
+                elif agent_subbranches:
+                    # 有 agent 失败，清理子分支
+                    for subbranch in agent_subbranches.values():
+                        self._cleanup_subbranch(subbranch)
 
                 if any(r.status == AgentStatus.FAILED for r in results):
                     failed = [r.agent_name for r in results if r.status == AgentStatus.FAILED]
@@ -2250,6 +2477,38 @@ class Orchestrator:
 # ============================================================
 # CLI接口
 # ============================================================
+
+def _open_file_in_editor(file_path: Path) -> None:
+    """
+    在用户默认编辑器中打开文件并等待关闭
+
+    跨平台支持:
+    - Windows: 使用 start /wait，回退到 notepad
+    - Linux/Mac: 使用 $EDITOR，回退到 nano/vi
+    """
+    import shutil
+
+    file_str = str(file_path)
+
+    if sys.platform == 'win32':
+        try:
+            subprocess.run(['cmd', '/c', 'start', '/wait', '', file_str], check=True)
+        except subprocess.CalledProcessError:
+            subprocess.run(['notepad', file_str])
+    else:
+        editor = os.environ.get('EDITOR', '')
+        if not editor:
+            for ed in ['code', 'nano', 'vim', 'vi']:
+                if shutil.which(ed):
+                    editor = ed
+                    break
+
+        if editor:
+            subprocess.run([editor, file_str])
+        else:
+            print(f"⚠️ 无法找到文本编辑器。请手动编辑: {file_path}")
+            input("编辑完成后按回车继续...")
+
 
 def semi_auto_mode(project_root: Path, config: dict):
     """
@@ -2372,9 +2631,46 @@ def semi_auto_mode(project_root: Path, config: dict):
         print(f"   文件路径: {plan_file}")
         print(f"   请检查文件是否存在且可读\n")
 
+    # === 阶段1: 提供计划审核/编辑选项 ===
+    print(f"\n{'='*60}")
+    print(f"📝 计划审核")
+    print(f"{'='*60}")
+    print(f"选项：")
+    print(f"  Y/y/是  - 打开编辑器查看/修改 PLAN.md")
+    print(f"  n/否    - 跳过编辑，直接进入执行确认")
+    print(f"  q/退出  - 取消执行，稍后使用模式2继续")
+
+    review_choice = input("\n是否查看/编辑 PLAN.md？[Y/n/q] ").strip().lower()
+
+    if review_choice in ['q', '退出', 'quit']:
+        print("\n已取消。你可以：")
+        print(f"  1. 手动编辑 PLAN.md: {plan_file}")
+        print(f"  2. 使用模式 2（从 PLAN.md 继续）重新运行")
+        return False
+
+    if review_choice not in ['n', 'no', '否']:
+        # 打开编辑器让用户查看/编辑
+        _open_file_in_editor(plan_file)
+        print(f"\n✅ 编辑器已关闭。")
+
+        # 重新读取 PLAN.md 显示更新后的预览
+        try:
+            with open(plan_file, 'r', encoding='utf-8', errors='replace') as f:
+                preview = f.read(500)
+            print(f"\n--- 更新后的 PLAN.md 预览 ---")
+            print(preview)
+            if len(preview) >= 500:
+                print("... (更多内容请查看文件)")
+            print(f"--- 预览结束 ---\n")
+        except (IOError, OSError, UnicodeDecodeError) as e:
+            print(f"\n⚠️ 重新读取 PLAN.md 失败: {e}")
+
+    # === 阶段2: 最终执行确认 ===
     confirm = input("确认执行后续 Agents？[Y/n] ").strip().lower()
     if confirm in ['n', 'no', '否']:
-        print("已取消。你可以修改 PLAN.md 后重新运行。")
+        print("\n已取消。你可以：")
+        print(f"  1. 继续修改 PLAN.md: {plan_file}")
+        print(f"  2. 使用模式 2（从 PLAN.md 继续）重新运行")
         return False
 
     # 读取 PLAN.md 作为任务描述（带容错）

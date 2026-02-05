@@ -534,8 +534,134 @@ claude --resume 038576c1-3914-4735-8d34-c7ae8f6092ac
 
 
 
+对 `src/6-agents.py` 多Agent调度系统进行全面测试和debug，修复发现的bug，确保系统能顺利工作。
+
+当前可能存在的bug：
+bug1：每次启动新任务，有没有自动新建branch？至少我测试了一轮，似乎branch没有被创建，任务就已经完成了；而且branch名称有个很旧的bug，之前自动生成的branch名称太复杂了，你尽量简化为【feature/agents名称简写-流水编号（例如001，并且能够递增，如果branch重名，就自动递增）】。工作完成后我会自己考虑push pr之类
+
+上一轮修复工作进展记录在 plan.md文件中，你仔细阅读该plan.md文件，然后继续完成对 `src/6-agents.py` 多Agent调度系统进行全面测试和debug
 
 
-当前修复工作进展记录在 plan.md文件中，你仔细阅读该plan文件，然后继续完成下面的工作
+2026-02-05 night
+-----------------------------
+
+  # 第 2214 行：所有 agents 并行执行（在同一个 branch 上）
+  results = await asyncio.gather(*tasks)
+
+  潜在风险：
+  # 例如用户输入：
+  @developer 修复 src/main.py 的bug && @optimizer 优化 src/main.py 的性能
+
+  # 结果：
+  # 1. 创建 1 个 branch：feature/dev-001
+  # 2. developer 和 optimizer 同时在这个 branch 上修改 src/main.py
+  # 3. 可能发生文件冲突或互相覆盖
+
+  ---
+  问题 3: 工作完成后，如何手工处理 2 个 branch？
+
+  答案：实际上只有 1 个 branch，无需处理多个 branch
+
+  工作流程：
+
+  # 1. 任务完成后，系统会提示：
+  # ✅ 任务完成！当前在分支: feature/dev-001
+  #
+  # 下一步：
+  #      git add . && git commit -m "完成任务"
+  #      然后可以选择：
+  #      - 切换回主分支：git checkout main
+  #      - 合并修改：git merge feature/dev-001
+
+  # 2. 你可以手动处理：
+  git status                    # 查看修改内容
+  git diff                      # 查看详细改动
+  git add .                     # 暂存修改
+  git commit -m "完成任务"      # 提交
+  git checkout main             # 切回主分支
+  git merge feature/dev-001     # 合并 feature 分支
+  git branch -d feature/dev-001 # 删除 feature 分支（可选）
+
+  ---
+  🚨 设计限制和建议
+
+  当前限制
+
+  1. 不支持多 branch 隔离
+    - 所有 agents 共享一个 feature branch
+    - 并行 agents 可能互相干扰
+  2. 冲突处理
+    - 如果多个 agents 修改同一文件，依赖文件系统的最后写入胜出
+    - 没有自动冲突检测或合并机制
+
+  使用建议
+
+  ✅ 安全的多 agent 并行场景：
+  # 不同文件，不会冲突
+  @developer 修复 src/fileA.py && @tester 测试 tests/fileB.py
+
+  # 不同模块，低冲突风险
+  @developer 开发前端组件 && @security 审计后端API
+
+  ⚠️ 有风险的并行场景：
+  # 同一文件，高冲突风险
+  @developer 修复 main.py && @optimizer 优化 main.py
+
+  # 建议改为串行：
+  @developer 修复 main.py -> @optimizer 优化 main.py
+
+  🔧 手动隔离方案（如果需要）：
+  # 方案 1: 分两次任务
+  # 第一次
+  python src/6-agents.py
+  > @developer 修复 main.py
+  # 完成后提交到 feature/dev-001
+
+  # 第二次
+  python src/6-agents.py
+  > @optimizer 优化 main.py
+  # 完成后提交到 feature/opti-002
+
+  # 然后手动合并两个 branch
+  git checkout main
+  git merge feature/dev-001
+  git merge feature/opti-002  # 手动解决冲突
+
+  # 方案 2: 手动创建分支
+  # 启动第一个 agent 前
+  git checkout -b feature/dev-manual
+  python src/6-agents.py
+  > @developer 修复 main.py
+
+  # 启动第二个 agent 前
+  git checkout -b feature/opti-manual
+  python src/6-agents.py
+  > @optimizer 优化 main.py
+
+  ---
+  总结
+  ┌────────────────────────┬───────┬──────────────────────────────────────┐
+  │          问题          │ 答案  │                关键点                │
+  ├────────────────────────┼───────┼──────────────────────────────────────┤
+  │ 是否自动创建 branch？  │ ✅ 是 │ 所有模式（除了 resume 模式）都会创建 │
+  ├────────────────────────┼───────┼──────────────────────────────────────┤
+  │ 并行 agents 是否隔离？ │ ❌ 否 │ 所有 agents 共享 1 个 feature branch │
+  ├────────────────────────┼───────┼──────────────────────────────────────┤
+  │ 如何处理多个 branch？  │ N/A   │ 实际只有 1 个 branch，无需处理多个   │
+  └────────────────────────┴───────┴──────────────────────────────────────┘
+  最佳实践：
+  - 并行执行不同文件/模块的任务 ✅
+  - 需要修改同一文件时，使用串行 -> 而不是并行 && ✅
+  - 如果确实需要隔离，手动分两次任务或手动创建分支 ⚠️
+
+
+
+
+
+
+-------再来一次------
 
 对 `src/6-agents.py` 多Agent调度系统进行全面测试和debug，修复发现的bug，确保系统能顺利工作。
+
+上一轮修复工作进展记录在 plan.md文件中，你仔细阅读该plan.md文件，然后继续完成对 `src/6-agents.py` 多Agent调度系统进行全面测试和debug
+
