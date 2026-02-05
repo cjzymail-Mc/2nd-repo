@@ -26,6 +26,12 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
+# Claude 账户配置目录
+CLAUDE_CONFIG_DIRS = {
+    'mc': os.path.expanduser('~/.claude-mc'),  # 账户1: mc
+    'xh': os.path.expanduser('~/.claude-xh')   # 账户2: xh
+}
+
 # Windows 控制台 UTF-8 编码支持
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -46,7 +52,8 @@ class AgentStatus(Enum):
 
 class TaskComplexity(Enum):
     """任务复杂度"""
-    SIMPLE = "simple"        # 仅3个agents (architect → developer → tester)
+    MINIMAL = "minimal"      # 2个agents (developer + tester)
+    SIMPLE = "simple"        # 3个agents (architect → developer → tester)
     MODERATE = "moderate"    # 4-5个agents
     COMPLEX = "complex"      # 完整6个agents
 
@@ -226,7 +233,12 @@ class AgentScheduler:
         根据复杂度规划执行阶段
         返回：[[Phase1 agents], [Phase2 agents], ...]
         """
-        if complexity == TaskComplexity.SIMPLE:
+        if complexity == TaskComplexity.MINIMAL:
+            return [
+                ["developer"],
+                ["tester"]
+            ]
+        elif complexity == TaskComplexity.SIMPLE:
             return [
                 ["architect"],
                 ["developer"],
@@ -1193,13 +1205,19 @@ class Orchestrator:
             print(f"⚠️ Git 操作失败: {e}")
             return None
 
-    async def execute(self, user_request: str, clean_start: bool = True) -> bool:
+    async def execute(
+        self,
+        user_request: str,
+        clean_start: bool = True,
+        override_complexity: Optional[TaskComplexity] = None
+    ) -> bool:
         """
         执行完整工作流
 
         Args:
             user_request: 用户需求描述
             clean_start: 是否清理旧状态（默认True，--resume时为False）
+            override_complexity: 手动指定复杂度（可选，优先于自动解析）
 
         Returns:
             True if successful, False if failed
@@ -1213,8 +1231,15 @@ class Orchestrator:
 
         # Phase 0.2: 解析任务
         print(f"📋 用户需求: {user_request}", flush=True)
-        task_prompt, complexity = self.task_parser.parse(user_request)
-        print(f"任务复杂度: {complexity.value}", flush=True)
+
+        # 使用覆盖的复杂度，或自动解析
+        if override_complexity:
+            complexity = override_complexity
+            task_prompt = user_request
+            print(f"任务复杂度: {complexity.value}（用户指定）", flush=True)
+        else:
+            task_prompt, complexity = self.task_parser.parse(user_request)
+            print(f"任务复杂度: {complexity.value}（自动解析）", flush=True)
 
         # Phase 0.5: 规划执行阶段
         phases = self.scheduler.plan_execution(complexity)
@@ -1824,7 +1849,8 @@ class Orchestrator:
         self,
         user_request: str,
         clean_start: bool = True,
-        existing_state: Optional[Dict] = None
+        existing_state: Optional[Dict] = None,
+        override_complexity: Optional[TaskComplexity] = None
     ) -> bool:
         """
         带多轮循环的执行模式
@@ -1837,6 +1863,7 @@ class Orchestrator:
             user_request: 用户请求
             clean_start: 是否清理旧状态
             existing_state: 现有状态（恢复时使用）
+            override_complexity: 手动指定复杂度（可选，优先于自动解析）
 
         Returns:
             True if successful, False if failed
@@ -1849,8 +1876,12 @@ class Orchestrator:
             print("🧹 已清理旧的状态文件\n")
 
         # 解析任务复杂度
-        complexity = self.task_parser.parse_complexity(user_request)
-        print(f"📊 任务复杂度: {complexity.value}")
+        if override_complexity:
+            complexity = override_complexity
+            print(f"📊 任务复杂度: {complexity.value}（用户指定）")
+        else:
+            _, complexity = self.task_parser.parse(user_request)
+            print(f"📊 任务复杂度: {complexity.value}（自动解析）")
 
         # 获取执行计划
         phases = self.scheduler.plan_execution(complexity)
@@ -2471,6 +2502,21 @@ def _ask_max_rounds() -> int:
         return 1
 
 
+def _ask_task_complexity() -> TaskComplexity:
+    """询问用户选择任务复杂度"""
+    print("""
+任务复杂度：
+  1. 简单任务 - 只用 developer + tester（2个agents，快速执行）
+  2. 复杂任务 - 完整流程（6个agents，全面保障）
+""")
+    complexity_choice = input("请选择 [1/2，直接回车=2]: ").strip()
+
+    if complexity_choice == '1':
+        return TaskComplexity.MINIMAL
+    else:
+        return TaskComplexity.COMPLEX
+
+
 def interactive_mode(project_root: Path):
     """交互式 CLI 模式 - 默认进入半自动模式"""
     print("""
@@ -2482,7 +2528,7 @@ def interactive_mode(project_root: Path):
   1. 半自动模式（推荐）- 进入 Claude CLI 讨论需求，生成 PLAN.md 后自动执行
   2. 从 PLAN.md 继续 - 跳过 Architect，直接从现有计划执行（节省 token）
   3. 全自动模式 - 输入任务后，Architect 自动规划并执行全流程
-  4. 传统交互模式 - 在此输入需求，可手动指定 agents
+  4. （ADV）多agent模式* - 可同时指派多名 Agents🚀🚀🚀
   5. 退出
 """)
 
@@ -2501,14 +2547,23 @@ def interactive_mode(project_root: Path):
         print("\n👋 再见！")
         return
 
-    # 模式 1/2/3 都需要询问迭代轮数
+    # 模式 1/2/3 都需要询问迭代轮数和任务复杂度
     if choice in ['1', '2', '3', '']:
+        # 询问迭代轮数
         config['max_rounds'] = _ask_max_rounds()
         if config['max_rounds'] > 1:
             print(f"✓ 已设置: 最多 {config['max_rounds']} 轮 developer-tester 迭代\n")
 
+        # 询问任务复杂度
+        config['complexity'] = _ask_task_complexity()
+        complexity_label = "简单任务（2个agents）" if config['complexity'] == TaskComplexity.MINIMAL else "复杂任务（6个agents）"
+        print(f"✓ 已设置: {complexity_label}\n")
+
     if choice == '1' or choice == '':
         # 半自动模式
+        # 注意：半自动模式会进入 Claude CLI 生成 PLAN.md，复杂度设置会被忽略
+        if config.get('complexity') == TaskComplexity.MINIMAL:
+            print("⚠️ 注意：半自动模式会由 Architect 自动规划，复杂度设置将被忽略\n")
         success = semi_auto_mode(project_root, config)
         if success:
             print("\n✅ 所有 Agents 执行完成！")
@@ -2516,6 +2571,9 @@ def interactive_mode(project_root: Path):
 
     if choice == '2':
         # 从 PLAN.md 继续执行
+        # 注意：PLAN.md 已存在，复杂度设置会被忽略
+        if config.get('complexity') == TaskComplexity.MINIMAL:
+            print("⚠️ 注意：从 PLAN.md 继续模式会按计划执行，复杂度设置将被忽略\n")
         success = from_plan_mode(project_root, config)
         if success:
             print("\n✅ 所有 Agents 执行完成！")
@@ -2550,9 +2608,15 @@ def interactive_mode(project_root: Path):
 
         print(f"\n🚀 全自动模式启动...")
         if config['max_rounds'] > 1:
-            success = asyncio.run(orchestrator.execute_with_loop(task_input))
+            success = asyncio.run(orchestrator.execute_with_loop(
+                task_input,
+                override_complexity=config.get('complexity')
+            ))
         else:
-            success = asyncio.run(orchestrator.execute(task_input))
+            success = asyncio.run(orchestrator.execute(
+                task_input,
+                override_complexity=config.get('complexity')
+            ))
 
         if success:
             print("\n✅ 所有 Agents 执行完成！")
@@ -2807,8 +2871,52 @@ def interactive_mode(project_root: Path):
             continue
 
 
+def _select_account() -> str:
+    """
+    选择 Claude 账户
+
+    Returns:
+        选中的账户标识 ('mc' 或 'xh')
+    """
+    print("""
+╔════════════════════════════════════════════════════════════╗
+║       🔐 Claude 账户选择                                    ║
+╚════════════════════════════════════════════════════════════╝
+
+可用账户：
+  mc - Claude Pro 账户 (mc)
+  xh - Claude Pro 账户 (xh)
+""")
+
+    while True:
+        choice = input("请选择账户 [mc/xh，直接回车=mc]: ").strip().lower()
+
+        if not choice:
+            choice = 'mc'
+
+        if choice in CLAUDE_CONFIG_DIRS:
+            config_dir = CLAUDE_CONFIG_DIRS[choice]
+
+            # 检查配置目录是否存在
+            if not os.path.exists(config_dir):
+                print(f"⚠️ 警告: 配置目录不存在: {config_dir}")
+                print(f"   请先运行 'claude-{choice}' 初始化配置\n")
+                continue
+
+            # 设置环境变量
+            os.environ['CLAUDE_CONFIG_DIR'] = config_dir
+            print(f"✓ 已选择账户: {choice}")
+            print(f"✓ 配置目录: {config_dir}\n")
+            return choice
+        else:
+            print(f"❌ 无效选择: {choice}，请输入 'mc' 或 'xh'\n")
+
+
 def main():
     """CLI入口"""
+    # 步骤0: 选择 Claude 账户
+    selected_account = _select_account()
+
     parser = argparse.ArgumentParser(
         description="mc-dir - 多Agent智能调度系统",
         formatter_class=argparse.RawDescriptionHelpFormatter,
