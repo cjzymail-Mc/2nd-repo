@@ -1,8 +1,9 @@
+---
 name: architect
 description: 系统架构师，负责代码库分析、需求理解、设计系统结构并生成实施计划。
-color: purple
 model: sonnet
-tools: Read, Glob, Grep, Bash(ls), Bash(tree), Bash(git status), Bash(git diff), Bash(git log), Task(Explore)
+tools: Read, Glob, Grep, Bash, Task
+---
 
 # 角色定义
 
@@ -180,6 +181,20 @@ tools: Read, Glob, Grep, Bash(ls), Bash(tree), Bash(git status), Bash(git diff),
 ---
 
 # 输出文件
+
+## 🚨 重要：输出文件位置
+
+**所有输出文件必须保存在项目根目录，使用 Write 工具写入：**
+
+| 文件名 | 位置 | 说明 |
+|--------|------|------|
+| `PLAN.md` | 项目根目录 | 详细实施计划（必须生成） |
+| `CODEBASE_ANALYSIS.md` | 项目根目录 | 代码库分析报告 |
+
+**正确的输出方式：**
+- ✅ 使用 Write 工具，路径填 `PLAN.md`（相对路径）
+- ✅ 使用 Write 工具，路径填 `CODEBASE_ANALYSIS.md`
+- ❌ 不要依赖 Claude CLI 的默认 plan 文件位置
 
 ## 现有项目
 

@@ -26,6 +26,11 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
+# Windows 控制台 UTF-8 编码支持
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 
 # ============================================================
 # 数据结构定义
@@ -123,7 +128,8 @@ class TaskParser:
                 ['git', 'log', '--oneline', '-1'],
                 cwd=str(self.project_root),
                 capture_output=True,
-                text=True
+                text=True,
+                encoding='utf-8'
             )
             if result.returncode == 0 and result.stdout.strip():
                 return True
@@ -376,6 +382,62 @@ class AgentExecutor:
         self.project_root = project_root
         self.max_budget = max_budget
 
+    def _parse_agent_file(self, content: str) -> Tuple[Dict, str]:
+        """
+        解析 agent 文件，分离 YAML frontmatter 和正文
+
+        Args:
+            content: agent 文件的完整内容
+
+        Returns:
+            (metadata, body) - 元数据字典和正文内容
+        """
+        content = content.strip()
+
+        # 检查是否以 --- 开头
+        if not content.startswith('---'):
+            # 没有 frontmatter，整个内容都是正文
+            return {}, content
+
+        # 更健壮的正则匹配 YAML frontmatter
+        # 支持：---\n...\n--- 或 ---\r\n...\r\n--- (Windows换行)
+        # 也支持 frontmatter 后面没有换行的情况
+        patterns = [
+            r'^---[ \t]*[\r\n]+(.*?)[\r\n]+---[ \t]*[\r\n]+(.*)$',  # 标准格式
+            r'^---[ \t]*[\r\n]+(.*?)[\r\n]+---[ \t]*$',  # frontmatter 后无内容
+            r'^---[ \t]*[\r\n]+---[ \t]*[\r\n]+(.*)$',  # 空 frontmatter
+        ]
+
+        metadata = {}
+        body = content
+
+        for i, pattern in enumerate(patterns):
+            match = re.match(pattern, content, re.DOTALL)
+            if match:
+                if i == 2:  # 空 frontmatter 模式
+                    body = match.group(1).strip() if match.lastindex >= 1 else ""
+                elif i == 1:  # frontmatter 后无内容
+                    frontmatter_str = match.group(1)
+                    body = ""
+                    # 解析 frontmatter
+                    for line in frontmatter_str.split('\n'):
+                        line = line.strip()
+                        if ':' in line and not line.startswith('#'):
+                            key, value = line.split(':', 1)
+                            metadata[key.strip()] = value.strip()
+                else:  # 标准格式
+                    frontmatter_str = match.group(1)
+                    body = match.group(2).strip()
+                    # 解析 frontmatter
+                    for line in frontmatter_str.split('\n'):
+                        line = line.strip()
+                        if ':' in line and not line.startswith('#'):
+                            key, value = line.split(':', 1)
+                            metadata[key.strip()] = value.strip()
+                break
+
+        return metadata, body
+
     async def run_agent(
         self,
         config: AgentConfig,
@@ -396,11 +458,12 @@ class AgentExecutor:
             session_id = str(uuid.uuid4())
         start_time = time.time()
 
-        # 读取agent角色配置
+        # 读取并解析 agent 角色配置（分离 YAML frontmatter）
         role_file = self.project_root / config.role_file
         try:
             with open(role_file, 'r', encoding='utf-8') as f:
-                role_prompt = f.read()
+                content = f.read()
+            metadata, role_prompt = self._parse_agent_file(content)
         except FileNotFoundError:
             return ExecutionResult(
                 agent_name=config.name,
@@ -414,6 +477,9 @@ class AgentExecutor:
                 error_message=f"角色配置文件不存在: {config.role_file}"
             )
 
+        # 从 metadata 中获取 model（如果有的话）
+        agent_model = metadata.get('model', 'sonnet')
+
         # 构建完整提示词
         full_prompt = f"{role_prompt}\n\n---\n\n{task_prompt}"
 
@@ -422,12 +488,23 @@ class AgentExecutor:
             "claude", "-p", full_prompt,
             "--output-format", "stream-json",
             "--verbose",  # stream-json 格式需要 verbose
-            "--model", "sonnet",
+            "--model", agent_model,
             "--max-turns", "20",
             "--max-budget-usd", str(self.max_budget),
             "--session-id", session_id,
             "--no-chrome"
         ]
+
+        # 进度指示器
+        async def progress_indicator(agent_name: str, start: float):
+            """周期性打印进度信息"""
+            indicators = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+            idx = 0
+            while True:
+                elapsed = time.time() - start
+                print(f"\r      {indicators[idx]} {agent_name} 工作中... ({elapsed:.0f}s)", end="", flush=True)
+                idx = (idx + 1) % len(indicators)
+                await asyncio.sleep(1)
 
         # 异步执行子进程
         try:
@@ -443,6 +520,9 @@ class AgentExecutor:
                 env=env
             )
 
+            # 启动进度指示器
+            progress_task = asyncio.create_task(progress_indicator(config.name, start_time))
+
             # 等待完成（带超时）
             try:
                 stdout, stderr = await asyncio.wait_for(
@@ -450,6 +530,8 @@ class AgentExecutor:
                     timeout=timeout
                 )
             except asyncio.TimeoutError:
+                progress_task.cancel()
+                print()  # 换行
                 process.kill()
                 return ExecutionResult(
                     agent_name=config.name,
@@ -462,6 +544,14 @@ class AgentExecutor:
                     output_files=[],
                     error_message=f"执行超时（{timeout}s）"
                 )
+            finally:
+                # 停止进度指示器
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
+                print()  # 换行，结束进度行
 
             # 解析stream-json输出获取成本和tokens
             cost, tokens = self._parse_stream_json(stdout.decode('utf-8'))
@@ -506,7 +596,7 @@ class AgentExecutor:
     ) -> ExecutionResult:
         """
         以交互式模式执行agent（用于architect阶段）
-        用户可以反复讨论计划，直到满意
+        自动发送初始任务，用户可继续讨论直到满意
 
         Returns:
             ExecutionResult with basic info (详细成本等需手动检查)
@@ -515,11 +605,12 @@ class AgentExecutor:
             session_id = str(uuid.uuid4())
         start_time = time.time()
 
-        # 读取agent角色配置
+        # 读取并解析 agent 角色配置（分离 YAML frontmatter）
         role_file = self.project_root / config.role_file
         try:
             with open(role_file, 'r', encoding='utf-8') as f:
-                role_prompt = f.read()
+                content = f.read()
+            metadata, role_prompt = self._parse_agent_file(content)
         except FileNotFoundError:
             return ExecutionResult(
                 agent_name=config.name,
@@ -533,29 +624,41 @@ class AgentExecutor:
                 error_message=f"角色配置文件不存在: {config.role_file}"
             )
 
-        # 构建初始提示词
-        full_prompt = f"{role_prompt}\n\n---\n\n{task_prompt}"
+        # 从 metadata 中获取 model（如果有的话）
+        agent_model = metadata.get('model', 'sonnet')
 
-        print(f"\n{'='*60}")
-        print(f"🎯 启动交互式规划会话 - {config.name}")
-        print(f"{'='*60}")
-        print(f"提示：你可以和 architect 反复讨论计划，直到完美")
-        print(f"完成后请确保生成了 PLAN.md 文件，然后退出会话")
-        print(f"{'='*60}\n")
+        # 构建初始提示词，明确指定输出文件位置
+        output_instruction = """
 
-        # 写入临时提示文件（避免命令行参数过长）
-        temp_prompt_file = self.project_root / ".claude" / f"prompt_{session_id}.txt"
-        temp_prompt_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(temp_prompt_file, 'w', encoding='utf-8') as f:
-            f.write(full_prompt)
+---
 
-        # 构建交互式claude命令（不使用 -p）
+## 输出要求
+
+请将计划文件保存到项目根目录：
+- `PLAN.md` - 实施计划（必须生成）
+- `CODEBASE_ANALYSIS.md` - 代码库分析（如果是现有项目）
+
+完成后请告知用户已生成上述文件。
+"""
+        full_prompt = f"{role_prompt}\n\n---\n\n{task_prompt}{output_instruction}"
+
+        print(f"\n{'='*60}", flush=True)
+        print(f"🎯 启动交互式规划会话 - {config.name}", flush=True)
+        print(f"{'='*60}", flush=True)
+        print(f"📋 初始任务将自动发送，无需手动输入", flush=True)
+        print(f"💡 你可以继续与 {config.name} 讨论，直到满意", flush=True)
+        print(f"📄 完成后输入 /exit 退出会话", flush=True)
+        print(f"{'='*60}\n", flush=True)
+
+        # 构建交互式 claude 命令
+        # 直接传入 prompt 参数，claude 会自动执行后保持交互模式
+        # 注意：--max-budget-usd 只在 --print 模式下生效，交互式模式下忽略
         cmd = [
             "claude",
-            "-p", full_prompt,
-            "--model", "sonnet",
-            "--max-budget-usd", str(self.max_budget),
-            "--session-id", session_id
+            "--model", agent_model,
+            "--permission-mode", "plan",  # 自动进入 plan 模式
+            "--append-system-prompt", role_prompt,  # 角色定义作为系统提示
+            task_prompt + output_instruction,  # 用户任务作为初始 prompt
         ]
 
         # 同步执行（阻塞等待用户交互）
@@ -564,22 +667,17 @@ class AgentExecutor:
             env = os.environ.copy()
             env['ORCHESTRATOR_RUNNING'] = 'true'
 
-            # 使用 subprocess.run 而不是 asyncio（需要继承 stdin/stdout）
+            # 使用 subprocess.run，不重定向 stdin/stdout/stderr，让用户直接交互
             process = subprocess.run(
                 cmd,
                 cwd=str(self.project_root),
                 env=env
-                # 不重定向 stdin/stdout/stderr，让用户直接交互
             )
 
             duration = time.time() - start_time
 
             # 检查输出文件是否生成
             output_files = self._check_output_files(config.output_files)
-
-            # 清理临时文件
-            if temp_prompt_file.exists():
-                temp_prompt_file.unlink()
 
             status = AgentStatus.COMPLETED if process.returncode == 0 else AgentStatus.FAILED
 
@@ -597,10 +695,6 @@ class AgentExecutor:
             )
 
         except Exception as e:
-            # 清理临时文件
-            if temp_prompt_file.exists():
-                temp_prompt_file.unlink()
-
             return ExecutionResult(
                 agent_name=config.name,
                 status=AgentStatus.FAILED,
@@ -626,21 +720,57 @@ class AgentExecutor:
         results = await asyncio.gather(*tasks)
         return {r.agent_name: r for r in results}
 
-    def _parse_stream_json(self, stdout: str) -> Tuple[float, int]:
+    def _parse_stream_json(self, stdout: str, verbose: bool = False) -> Tuple[float, int]:
         """
         解析stream-json输出获取成本和tokens
-        简化实现：从最后一行提取
+
+        Args:
+            stdout: claude 命令的标准输出
+            verbose: 是否输出详细日志
+
+        Returns:
+            (cost, tokens) 元组
         """
-        try:
-            lines = stdout.strip().split('\n')
-            for line in reversed(lines):
-                if line.strip():
-                    data = json.loads(line)
-                    cost = data.get('cost', 0)
-                    tokens = data.get('tokens', 0)
-                    return cost, tokens
-        except:
-            pass
+        if not stdout or not stdout.strip():
+            if verbose:
+                print("  [调试] stream-json 输出为空")
+            return 0.0, 0
+
+        lines = stdout.strip().split('\n')
+
+        # 从后往前查找有效的 JSON 行
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                data = json.loads(line)
+                cost = data.get('cost', 0)
+                tokens = data.get('tokens', 0)
+
+                # 尝试从不同字段获取 tokens
+                if tokens == 0:
+                    tokens = data.get('total_tokens', 0)
+                    if tokens == 0 and 'usage' in data:
+                        usage = data['usage']
+                        tokens = usage.get('total_tokens', 0)
+
+                return float(cost), int(tokens)
+
+            except json.JSONDecodeError as e:
+                # 这行不是有效 JSON，继续尝试下一行
+                if verbose:
+                    print(f"  [调试] JSON 解析失败: {str(e)[:50]}")
+                continue
+            except (TypeError, ValueError) as e:
+                if verbose:
+                    print(f"  [调试] 数据类型转换失败: {e}")
+                continue
+
+        # 没有找到有效的成本/tokens 信息
+        if verbose:
+            print("  [调试] 未在输出中找到成本/tokens 信息")
         return 0.0, 0
 
     def _check_output_files(self, expected_files: List[str]) -> List[str]:
@@ -892,22 +1022,55 @@ class Orchestrator:
                 except Exception:
                     pass
 
-    def _create_feature_branch(self, task_description: str) -> Optional[str]:
+    def _get_next_branch_number(self) -> int:
+        """
+        获取下一个分支流水号
+
+        Returns:
+            3位流水号（从001开始）
+        """
+        counter_file = self.project_root / ".claude" / "branch_counter.txt"
+        counter_file.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if counter_file.exists():
+                with open(counter_file, 'r', encoding='utf-8') as f:
+                    counter = int(f.read().strip())
+            else:
+                counter = 0
+
+            counter += 1
+
+            with open(counter_file, 'w', encoding='utf-8') as f:
+                f.write(str(counter))
+
+            return counter
+        except Exception:
+            return 1
+
+    def _create_feature_branch(self, task_description: str, first_agent: str = "arch") -> Optional[str]:
         """
         为任务创建 feature 分支
+
+        Args:
+            task_description: 任务描述（仅用于日志）
+            first_agent: 首个执行的 agent 名称
 
         Returns:
             分支名称，如果失败则返回 None
         """
-        import re
-        from datetime import datetime
+        # Agent 简写映射
+        agent_abbrev = {
+            "architect": "arch",
+            "tech_lead": "tech",
+            "developer": "dev",
+            "tester": "test",
+            "optimizer": "opti",
+            "security": "sec",
+        }
 
-        # 生成分支名：feature/task-description-timestamp
-        # 清理任务描述：只保留字母数字和短横线
-        clean_desc = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]+', '-', task_description)
-        clean_desc = clean_desc[:30]  # 限制长度
-        timestamp = datetime.now().strftime("%m%d-%H%M")
-        branch_name = f"feature/orchestrator-{clean_desc}-{timestamp}"
+        # 获取 agent 简写
+        abbrev = agent_abbrev.get(first_agent, first_agent[:4])
 
         try:
             # 检查是否在 git 仓库中
@@ -915,25 +1078,46 @@ class Orchestrator:
                 ["git", "rev-parse", "--git-dir"],
                 cwd=str(self.project_root),
                 capture_output=True,
-                text=True
+                text=True,
+                encoding='utf-8'
             )
             if result.returncode != 0:
                 return None  # 不是 git 仓库，跳过分支创建
 
-            # 创建并切换到新分支
-            result = subprocess.run(
-                ["git", "checkout", "-b", branch_name],
-                cwd=str(self.project_root),
-                capture_output=True,
-                text=True
-            )
+            # 尝试创建分支，如果已存在则递增编号重试（最多尝试 10 次）
+            for _ in range(10):
+                branch_num = self._get_next_branch_number()
+                branch_name = f"feature/{abbrev}-{branch_num:03d}"
 
-            if result.returncode == 0:
-                print(f"🌿 已创建并切换到分支: {branch_name}")
-                return branch_name
-            else:
-                print(f"⚠️ 创建分支失败: {result.stderr}")
-                return None
+                # 检查分支是否已存在
+                check_result = subprocess.run(
+                    ["git", "rev-parse", "--verify", branch_name],
+                    cwd=str(self.project_root),
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8'
+                )
+
+                if check_result.returncode != 0:
+                    # 分支不存在，可以创建
+                    result = subprocess.run(
+                        ["git", "checkout", "-b", branch_name],
+                        cwd=str(self.project_root),
+                        capture_output=True,
+                        text=True,
+                        encoding='utf-8'
+                    )
+
+                    if result.returncode == 0:
+                        print(f"🌿 已创建并切换到分支: {branch_name}")
+                        return branch_name
+                    else:
+                        print(f"⚠️ 创建分支失败: {result.stderr}")
+                        return None
+                # 分支已存在，继续循环尝试下一个编号
+
+            print(f"⚠️ 无法创建分支：尝试了多个编号都已存在")
+            return None
 
         except Exception as e:
             print(f"⚠️ Git 操作失败: {e}")
@@ -955,21 +1139,22 @@ class Orchestrator:
         # Phase 0: 清理旧状态（新任务时）
         if clean_start:
             self._cleanup_old_state()
-            print("🧹 已清理旧的状态文件和错误日志\n")
-
-        # Phase 0.1: 创建 feature 分支（新任务时）
-        feature_branch = None
-        if clean_start:
-            feature_branch = self._create_feature_branch(user_request)
+            print("🧹 已清理旧的状态文件和错误日志\n", flush=True)
 
         # Phase 0.2: 解析任务
-        print(f"📋 用户需求: {user_request}")
+        print(f"📋 用户需求: {user_request}", flush=True)
         task_prompt, complexity = self.task_parser.parse(user_request)
-        print(f"任务复杂度: {complexity.value}")
+        print(f"任务复杂度: {complexity.value}", flush=True)
 
         # Phase 0.5: 规划执行阶段
         phases = self.scheduler.plan_execution(complexity)
-        print(f"执行计划: {len(phases)} 个阶段\n")
+        print(f"执行计划: {len(phases)} 个阶段\n", flush=True)
+
+        # Phase 0.1: 创建 feature 分支（新任务时，需要先知道首个 agent）
+        feature_branch = None
+        if clean_start and phases:
+            first_agent = phases[0][0] if phases[0] else "arch"
+            feature_branch = self._create_feature_branch(user_request, first_agent)
 
         # 初始化状态
         task_id = str(uuid.uuid4())
@@ -1118,6 +1303,131 @@ class Orchestrator:
         state["total_duration"] = total_duration
         self.state_manager.save_state(state)
 
+    async def execute_from_plan(self, plan_content: str, existing_state: Optional[Dict] = None) -> bool:
+        """
+        从 PLAN.md 开始执行（跳过 architect 阶段）
+
+        用于情景2：半自动模式，architect 已在 claude CLI 中完成
+        也用于恢复中断的任务
+
+        Args:
+            plan_content: PLAN.md 的内容
+            existing_state: 现有状态（用于恢复时跳过已完成的 agent）
+
+        Returns:
+            True if successful, False if failed
+        """
+        start_time = time.time()
+
+        # 所有可能的 agents（跳过 architect）
+        all_agents = ["tech_lead", "developer", "tester", "optimizer", "security"]
+
+        # 如果有现有状态，过滤掉已完成的 agents
+        if existing_state and existing_state.get("agents_status"):
+            completed_agents = [
+                agent for agent, status in existing_state["agents_status"].items()
+                if status == "completed"
+            ]
+            remaining_agents = [a for a in all_agents if a not in completed_agents]
+            print(f"📂 已完成的 agents: {', '.join(completed_agents) if completed_agents else '无'}")
+            print(f"🔄 待执行的 agents: {', '.join(remaining_agents) if remaining_agents else '无'}")
+        else:
+            remaining_agents = all_agents
+
+        if not remaining_agents:
+            print("✅ 所有 agents 已完成，无需继续执行")
+            return True
+
+        # 构建提示词（包含 PLAN.md 内容）
+        task_prompt = f"""
+请根据以下实施计划执行你的职责：
+
+{plan_content}
+
+---
+
+请严格按照计划执行，确保与其他 agents 的工作保持一致。
+"""
+
+        # 初始化或恢复状态
+        if existing_state:
+            state = existing_state
+            all_results = {}
+            # 恢复已有结果
+            for agent_name, result_dict in state.get("results", {}).items():
+                if result_dict.get("status") == "completed":
+                    # 重建 ExecutionResult 对象用于统计
+                    all_results[agent_name] = ExecutionResult(
+                        agent_name=result_dict.get("agent_name", agent_name),
+                        status=AgentStatus.COMPLETED,
+                        session_id=result_dict.get("session_id", ""),
+                        exit_code=result_dict.get("exit_code", 0),
+                        duration=result_dict.get("duration", 0),
+                        cost=result_dict.get("cost", 0),
+                        tokens=result_dict.get("tokens", 0),
+                        output_files=result_dict.get("output_files", []),
+                        error_message=result_dict.get("error_message")
+                    )
+        else:
+            task_id = str(uuid.uuid4())
+            state = {
+                "task_id": task_id,
+                "user_request": "从 PLAN.md 执行",
+                "complexity": "from_plan",
+                "current_phase": 1,  # 从 phase 1 开始（跳过 phase 0 architect）
+                "agents_status": {"architect": "completed"},
+                "results": {},
+                "total_cost": 0.0,
+                "total_tokens": 0
+            }
+            all_results = {}
+
+        # 计算起始 phase 索引
+        start_phase_idx = len(all_agents) - len(remaining_agents) + 2
+
+        # 执行剩余 agents
+        for i, agent_name in enumerate(remaining_agents):
+            phase_idx = start_phase_idx + i
+            self.monitor.display_phase_start(phase_idx, [agent_name])
+
+            config = self.scheduler.get_agent_config(agent_name)
+            session_id = str(uuid.uuid4())
+
+            self.monitor.display_agent_start(config.name, session_id)
+
+            result = await self.error_handler.retry_with_backoff(
+                self.executor.run_agent,
+                config,
+                task_prompt,
+                session_id=session_id
+            )
+
+            self.monitor.display_agent_complete(result)
+            all_results[config.name] = result
+
+            # 更新状态
+            state["current_phase"] = phase_idx
+            state["agents_status"][config.name] = result.status.value
+            # 转换 ExecutionResult 为可序列化的字典
+            result_dict = asdict(result)
+            result_dict["status"] = result.status.value
+            state["results"][config.name] = result_dict
+            self.state_manager.save_state(state)
+
+            # 如果失败，终止执行
+            if result.status == AgentStatus.FAILED:
+                print(f"\n❌ {config.name} 执行失败，已保存状态")
+                print(f"   修复问题后，运行 python mc-dir.py --resume 继续")
+                self._save_final_state(state, all_results, time.time() - start_time)
+                return False
+
+        # 成功完成
+        total_duration = time.time() - start_time
+        self._save_final_state(state, all_results, total_duration)
+        self.monitor.display_summary(all_results, total_duration)
+
+        return True
+
     async def execute_manual(
         self,
         phases: List[List[Tuple[str, str]]],
@@ -1140,9 +1450,10 @@ class Orchestrator:
             self._cleanup_old_state()
             print("🧹 已清理旧的状态文件\n")
 
-        # 创建 feature 分支
-        first_task = phases[0][0][1] if phases else "manual-task"
-        feature_branch = self._create_feature_branch(first_task)
+        # 创建 feature 分支（使用首个 agent 名称）
+        first_agent = phases[0][0][0] if phases and phases[0] else "arch"
+        first_task = phases[0][0][1] if phases and phases[0] else "manual-task"
+        feature_branch = self._create_feature_branch(first_task, first_agent)
 
         # 初始化状态
         task_id = str(uuid.uuid4())
@@ -1264,16 +1575,147 @@ class Orchestrator:
 # CLI接口
 # ============================================================
 
+def semi_auto_mode(project_root: Path, config: dict):
+    """
+    情景2：半自动执行模式
+
+    流程：
+    1. 进入 claude CLI（plan 模式）讨论任务需求
+    2. 生成 PLAN.md 后退出 claude
+    3. 用户确认 PLAN.md
+    4. 自动执行剩余 agents
+    """
+    import subprocess
+
+    # 读取 architect 角色配置
+    arch_file = project_root / ".claude" / "agents" / "01-arch.md"
+    if arch_file.exists():
+        with open(arch_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+        # 分离 YAML frontmatter
+        if content.startswith('---'):
+            parts = content.split('---', 2)
+            if len(parts) >= 3:
+                arch_prompt = parts[2].strip()
+            else:
+                arch_prompt = content
+        else:
+            arch_prompt = content
+    else:
+        arch_prompt = "你是一个系统架构师，请分析需求并生成 PLAN.md"
+
+    # 添加强制限制的系统提示
+    system_prompt = f"""{arch_prompt}
+
+---
+
+## ⚠️ 关键限制 - 必须严格遵守
+
+**你是 Architect Agent，你的唯一任务是制定计划，而不是实现代码！**
+
+### 你必须做的事：
+1. 分析用户需求
+2. 如果是现有项目，先探索代码库并生成 `CODEBASE_ANALYSIS.md`
+3. 生成详细的 `PLAN.md` 实施计划
+4. 完成后告知用户输入 `/exit` 退出会话
+
+### 你绝对不能做的事：
+- ❌ 不要编写任何实现代码
+- ❌ 不要创建源代码文件（如 .py, .js, .ts 等）
+- ❌ 不要修改现有的源代码
+- ❌ 不要运行测试或构建命令
+- ❌ 不要尝试"帮用户完成任务"
+
+### 为什么？
+你是多 Agent 流水线的第一个环节。你的输出（PLAN.md）将交给后续的 Developer、Tester、Security 等 agents 执行。如果你直接实现代码，就破坏了整个流程。
+
+### 输出文件：
+- `PLAN.md` - 详细的实施计划（必须生成）
+- `CODEBASE_ANALYSIS.md` - 代码库分析（仅现有项目）
+
+当用户描述完需求后，请开始分析并生成计划文件。
+"""
+
+    print(f"\n{'='*60}", flush=True)
+    print(f"🎯 半自动模式 - 与 Architect 讨论任务", flush=True)
+    print(f"{'='*60}", flush=True)
+    print(f"💡 在 Claude CLI 中描述你的任务需求", flush=True)
+    print(f"📄 讨论完成后，Architect 会生成 PLAN.md", flush=True)
+    print(f"🚪 生成完毕后输入 /exit 退出，继续执行后续流程", flush=True)
+    print(f"{'='*60}\n", flush=True)
+
+    # 进入 claude CLI（plan 模式）
+    cmd = [
+        "claude",
+        "--permission-mode", "plan",
+        "--append-system-prompt", system_prompt,
+        "--max-budget-usd", str(config['max_budget']),
+    ]
+
+    env = os.environ.copy()
+    env['ORCHESTRATOR_RUNNING'] = 'true'
+
+    # 执行 claude（阻塞，用户交互）
+    process = subprocess.run(cmd, cwd=str(project_root), env=env)
+
+    # 检查 PLAN.md 是否生成
+    plan_file = project_root / "PLAN.md"
+    if not plan_file.exists():
+        print(f"\n⚠️ 未检测到 PLAN.md，流程终止")
+        print(f"   请重新运行并确保生成 PLAN.md")
+        return False
+
+    # 提示用户确认
+    print(f"\n{'='*60}")
+    print(f"📋 已检测到 PLAN.md")
+    print(f"   位置: {plan_file}")
+    print(f"{'='*60}")
+
+    # 显示 PLAN.md 前几行
+    with open(plan_file, 'r', encoding='utf-8') as f:
+        preview = f.read(500)
+    print(f"\n--- PLAN.md 预览 ---")
+    print(preview)
+    if len(preview) >= 500:
+        print("... (更多内容请查看文件)")
+    print(f"--- 预览结束 ---\n")
+
+    confirm = input("确认执行后续 Agents？[Y/n] ").strip().lower()
+    if confirm in ['n', 'no', '否']:
+        print("已取消。你可以修改 PLAN.md 后重新运行。")
+        return False
+
+    # 读取 PLAN.md 作为任务描述
+    with open(plan_file, 'r', encoding='utf-8') as f:
+        plan_content = f.read()
+
+    # 创建 orchestrator 执行剩余 agents
+    orchestrator = Orchestrator(
+        project_root=project_root,
+        max_budget=config['max_budget'],
+        max_retries=config['max_retries'],
+        verbose=config['verbose'],
+        interactive_architect=False  # architect 已完成
+    )
+
+    # 执行剩余阶段（跳过 architect）
+    print(f"\n🚀 开始执行后续 Agents...")
+    success = asyncio.run(orchestrator.execute_from_plan(plan_content))
+
+    return success
+
+
 def interactive_mode(project_root: Path):
-    """交互式 CLI 模式"""
+    """交互式 CLI 模式 - 默认进入半自动模式"""
     print("""
 ╔════════════════════════════════════════════════════════════╗
-║       🚀 Orchestrator - 多Agent智能调度系统                 ║
-║                                                            ║
-║  自动规划: 描述需求，系统自动调度多个 Agent 协作完成         ║
-║  手动指定: @agent 任务 -> @agent 任务 (串行/并行)           ║
-║  输入 help 查看帮助，agents 查看可用 agent                  ║
+║       🚀 mc-dir - 多Agent智能调度系统                       ║
 ╚════════════════════════════════════════════════════════════╝
+
+选择模式：
+  1. 半自动模式（推荐）- 进入 Claude CLI 讨论需求，生成 PLAN.md 后自动执行
+  2. 传统交互模式 - 在此输入需求，预览后执行
+  3. 退出
 """)
 
     # 默认配置
@@ -1283,6 +1725,22 @@ def interactive_mode(project_root: Path):
         'verbose': False,
         'auto_architect': False
     }
+
+    choice = input("请选择 [1/2/3]: ").strip()
+
+    if choice == '1' or choice == '':
+        # 半自动模式
+        success = semi_auto_mode(project_root, config)
+        if success:
+            print("\n✅ 所有 Agents 执行完成！")
+        return
+
+    if choice == '3':
+        print("\n👋 再见！")
+        return
+
+    # 传统交互模式
+    print("\n进入传统交互模式。输入 help 查看帮助，exit 退出。")
 
     while True:
         try:
@@ -1526,28 +1984,26 @@ def interactive_mode(project_root: Path):
 def main():
     """CLI入口"""
     parser = argparse.ArgumentParser(
-        description="Orchestrator - 星型拓扑多Agent并发调度系统",
+        description="mc-dir - 多Agent智能调度系统",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-交互模式（推荐）：
-  python orchestrator.py
+使用方式：
 
-  进入后直接描述需求：
-    帮我写一个网页版的赛车游戏
-    修复 src/main.py 中的登录 bug
+  情景1 - 全自动执行（复杂任务从 md 文件读取）：
+    python mc-dir.py task1.md --auto-architect
 
-传统命令行模式：
-  python orchestrator.py "修复src/main.py中的登录bug"
-  python orchestrator.py "帮我写一个赛车游戏" --max-budget 20.0
-  python orchestrator.py "任务描述" --auto-architect
-  python orchestrator.py --resume
+  情景2 - 半自动执行（进入 Claude CLI 讨论后自动执行）：
+    python mc-dir.py
+
+  恢复中断的任务：
+    python mc-dir.py --resume
         """
     )
 
     parser.add_argument(
         "request",
         nargs="?",
-        help="用户需求描述（不指定则进入交互模式）"
+        help="任务描述或 .md 文件路径（不指定则进入半自动模式）"
     )
     parser.add_argument(
         "--max-budget",
@@ -1574,7 +2030,7 @@ def main():
     parser.add_argument(
         "--auto-architect",
         action="store_true",
-        help="architect阶段使用自动模式（默认为交互式）"
+        help="全自动模式（跳过交互式规划）"
     )
 
     args = parser.parse_args()
@@ -1582,10 +2038,22 @@ def main():
     # 获取项目根目录
     project_root = Path.cwd()
 
-    # 如果没有指定需求且不是恢复模式，进入交互模式
+    # 情景2：无参数时进入半自动模式
     if not args.request and not args.resume:
         interactive_mode(project_root)
         return
+
+    # 情景1：从 .md 文件读取任务描述
+    user_request = args.request
+    if user_request and user_request.endswith('.md'):
+        task_file = project_root / user_request
+        if task_file.exists():
+            print(f"📄 从文件读取任务: {user_request}", flush=True)
+            with open(task_file, 'r', encoding='utf-8') as f:
+                user_request = f.read()
+        else:
+            print(f"❌ 任务文件不存在: {task_file}")
+            sys.exit(1)
 
     # 创建orchestrator实例
     orchestrator = Orchestrator(
@@ -1600,13 +2068,29 @@ def main():
     if args.resume:
         state = orchestrator.state_manager.load_state()
         if state:
-            print(f"📂 恢复任务: {state['user_request']}")
-            user_request = state['user_request']
+            print(f"📂 恢复任务: {state['user_request'][:50]}...")
+            # 检查是否是从 PLAN.md 执行的任务
+            if state.get('complexity') == 'from_plan':
+                # 读取 PLAN.md 继续执行
+                plan_file = project_root / "PLAN.md"
+                if plan_file.exists():
+                    with open(plan_file, 'r', encoding='utf-8') as f:
+                        plan_content = f.read()
+                    try:
+                        # 传入现有状态，跳过已完成的 agents
+                        success = asyncio.run(orchestrator.execute_from_plan(plan_content, existing_state=state))
+                        sys.exit(0 if success else 1)
+                    except KeyboardInterrupt:
+                        print("\n\n⚠️ 用户中断执行")
+                        sys.exit(130)
+                else:
+                    print("❌ PLAN.md 不存在，无法恢复")
+                    sys.exit(1)
+            else:
+                user_request = state['user_request']
         else:
             print("❌ 未找到可恢复的任务")
             sys.exit(1)
-    else:
-        user_request = args.request
 
     # 执行
     try:
