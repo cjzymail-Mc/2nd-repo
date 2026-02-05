@@ -484,20 +484,27 @@ class AgentExecutor:
         # 从 metadata 中获取 model（如果有的话）
         agent_model = metadata.get('model', 'sonnet')
 
-        # 构建完整提示词
-        full_prompt = f"{role_prompt}\n\n---\n\n{task_prompt}"
-
         # 构建claude命令
+        # 构建 claude 命令
+        # 注意：architect 使用 plan 模式（只读），其他 agents 使用 skip-permissions（可写）
         cmd = [
-            "claude", "-p", full_prompt,
+            "claude", "-p", task_prompt,
+            "--append-system-prompt", role_prompt,
             "--output-format", "stream-json",
-            "--verbose",  # stream-json 格式需要 verbose
+            "--verbose",
             "--model", agent_model,
             "--max-turns", "20",
             "--max-budget-usd", str(self.max_budget),
             "--session-id", session_id,
-            "--no-chrome"
+            "--no-chrome",
         ]
+
+        # architect 使用 plan 模式限制权限，防止直接修改代码
+        # 其他 agents 使用 skip-permissions 允许实际执行
+        if config.name == "architect":
+            cmd.extend(["--permission-mode", "plan"])
+        else:
+            cmd.append("--dangerously-skip-permissions")
 
         # 进度指示器
         async def progress_indicator(agent_name: str, start: float):
@@ -538,6 +545,10 @@ class AgentExecutor:
                 progress_task.cancel()
                 print()  # 换行
                 process.kill()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass  # 强制终止后仍超时，忽略
                 return ExecutionResult(
                     agent_name=config.name,
                     status=AgentStatus.FAILED,
@@ -559,7 +570,7 @@ class AgentExecutor:
                 print()  # 换行，结束进度行
 
             # 解析stream-json输出获取成本和tokens
-            cost, tokens = self._parse_stream_json(stdout.decode('utf-8'))
+            cost, tokens = self._parse_stream_json(stdout.decode('utf-8', errors='replace'))
 
             duration = time.time() - start_time
 
@@ -577,7 +588,7 @@ class AgentExecutor:
                 cost=cost,
                 tokens=tokens,
                 output_files=output_files,
-                error_message=stderr.decode('utf-8') if process.returncode != 0 else None
+                error_message=stderr.decode('utf-8', errors='replace') if process.returncode != 0 else None
             )
 
           except Exception as e:
@@ -767,8 +778,8 @@ class AgentExecutor:
                     if cost > 0 or tokens > 0:
                         return float(cost), int(tokens)
 
-                # 尝试多种字段名获取 cost
-                cost = data.get('cost_usd', 0) or data.get('cost', 0)
+                # 尝试多种字段名获取 cost（避免 or 短路：0 or x 返回 x）
+                cost = data.get('cost_usd') if 'cost_usd' in data else data.get('cost', 0)
 
                 # 尝试多种字段名获取 tokens
                 tokens = data.get('tokens', 0)
@@ -832,6 +843,8 @@ class StateManager:
 
     def save_state(self, state: Dict) -> None:
         """原子化保存状态"""
+        # 确保目录存在
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
         temp_file = self.state_file.with_suffix('.tmp')
         with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
@@ -901,11 +914,14 @@ class ErrorHandler:
             "session_id": result.session_id
         }
 
-        # 追加到错误日志
+        # 追加到错误日志（带容错）
         errors = []
         if self.error_log_file.exists():
-            with open(self.error_log_file, 'r', encoding='utf-8') as f:
-                errors = json.load(f)
+            try:
+                with open(self.error_log_file, 'r', encoding='utf-8') as f:
+                    errors = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                errors = []  # 文件损坏时重置为空列表
 
         errors.append(error_entry)
 
@@ -1022,7 +1038,8 @@ class Orchestrator:
         max_budget: float = 10.0,
         max_retries: int = 3,
         verbose: bool = False,
-        interactive_architect: bool = True
+        interactive_architect: bool = True,
+        max_rounds: int = 1
     ):
         self.project_root = project_root
         self.task_parser = TaskParser(project_root)
@@ -1032,6 +1049,7 @@ class Orchestrator:
         self.error_handler = ErrorHandler(project_root, max_retries)
         self.monitor = ProgressMonitor(verbose)
         self.interactive_architect = interactive_architect
+        self.max_rounds = max_rounds
 
     def _cleanup_old_state(self) -> None:
         """清理旧的状态文件和错误日志"""
@@ -1045,7 +1063,7 @@ class Orchestrator:
             if file.exists():
                 try:
                     file.unlink()
-                except Exception:
+                except (OSError, PermissionError):
                     pass  # 忽略清理失败
 
         # 清理旧的临时提示文件
@@ -1054,7 +1072,7 @@ class Orchestrator:
             for temp_file in claude_dir.glob("prompt_*.txt"):
                 try:
                     temp_file.unlink()
-                except Exception:
+                except (OSError, PermissionError):
                     pass
 
     def _get_next_branch_number(self) -> int:
@@ -1068,11 +1086,11 @@ class Orchestrator:
         counter_file.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            # 使用 r+ 模式打开（文件不存在则先创建）
-            if not counter_file.exists():
-                counter_file.write_text("0", encoding='utf-8')
+            # 使用 a+ 模式：文件不存在时自动创建，避免竞态窗口
+            with open(counter_file, 'a+', encoding='utf-8') as f:
+                # 先移动到文件开头再加锁（a+ 模式打开后指针在 EOF）
+                f.seek(0)
 
-            with open(counter_file, 'r+', encoding='utf-8') as f:
                 # Windows 文件锁
                 if sys.platform == 'win32':
                     import msvcrt
@@ -1096,8 +1114,9 @@ class Orchestrator:
                         msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
 
         except Exception:
-            # 降级方案：使用时间戳
-            return int(time.time()) % 1000
+            # 降级方案：毫秒时间戳 + 随机数，降低冲突概率
+            import random
+            return int(time.time() * 1000) % 100000 + random.randint(0, 99)
 
     def _create_feature_branch(self, task_description: str, first_agent: str = "arch") -> Optional[str]:
         """
@@ -1207,30 +1226,68 @@ class Orchestrator:
             first_agent = phases[0][0] if phases[0] else "arch"
             feature_branch = self._create_feature_branch(user_request, first_agent)
 
-        # 初始化状态
-        task_id = str(uuid.uuid4())
-        state = {
-            "task_id": task_id,
-            "user_request": user_request,
-            "complexity": complexity.value,
-            "current_phase": 0,
-            "agents_status": {},
-            "results": {},
-            "total_cost": 0.0,
-            "total_tokens": 0
-        }
+        # 初始化或恢复状态
+        existing_state = None
+        completed_agents = set()
+        if not clean_start:
+            existing_state = self.state_manager.load_state()
+            if existing_state:
+                # 获取已完成的 agents
+                completed_agents = {
+                    agent for agent, status in existing_state.get("agents_status", {}).items()
+                    if status == "completed"
+                }
+                if completed_agents:
+                    print(f"📂 跳过已完成的 agents: {', '.join(completed_agents)}", flush=True)
 
-        all_results = {}
+        if existing_state:
+            # 恢复状态
+            state = existing_state
+            all_results = {}
+            # 恢复已有结果用于统计
+            for agent_name, result_dict in state.get("results", {}).items():
+                if result_dict.get("status") == "completed":
+                    all_results[agent_name] = ExecutionResult(
+                        agent_name=result_dict.get("agent_name", agent_name),
+                        status=AgentStatus.COMPLETED,
+                        session_id=result_dict.get("session_id", ""),
+                        exit_code=result_dict.get("exit_code", 0),
+                        duration=result_dict.get("duration", 0),
+                        cost=result_dict.get("cost", 0),
+                        tokens=result_dict.get("tokens", 0),
+                        output_files=result_dict.get("output_files", []),
+                        error_message=result_dict.get("error_message")
+                    )
+        else:
+            # 新任务，创建全新状态
+            task_id = str(uuid.uuid4())
+            state = {
+                "task_id": task_id,
+                "user_request": user_request,
+                "complexity": complexity.value,
+                "current_phase": 0,
+                "agents_status": {},
+                "results": {},
+                "total_cost": 0.0,
+                "total_tokens": 0
+            }
+            all_results = {}
 
         # 执行各阶段
         for phase_idx, agent_names in enumerate(phases, 1):
-            self.monitor.display_phase_start(phase_idx, agent_names)
+            # 过滤掉已完成的 agents
+            remaining_agents = [name for name in agent_names if name not in completed_agents]
+            if not remaining_agents:
+                print(f"\n⏭️  Phase {phase_idx}: 所有 agents 已完成，跳过", flush=True)
+                continue
 
-            # 准备agent配置和提示词
-            configs = [self.scheduler.get_agent_config(name) for name in agent_names]
+            self.monitor.display_phase_start(phase_idx, remaining_agents)
+
+            # 准备agent配置和提示词（只准备未完成的）
+            configs = [self.scheduler.get_agent_config(name) for name in remaining_agents]
             prompts = {
                 name: self.task_parser.generate_initial_prompt(user_request, agent_name=name)
-                for name in agent_names
+                for name in remaining_agents
             }
 
             # 串行 or 并行执行
@@ -1476,6 +1533,543 @@ class Orchestrator:
         total_duration = time.time() - start_time
         self._save_final_state(state, all_results, total_duration)
         self.monitor.display_summary(all_results, total_duration)
+
+        return True
+
+    async def execute_from_plan_with_loop(
+        self,
+        plan_content: str,
+        existing_state: Optional[Dict] = None
+    ) -> bool:
+        """
+        从 PLAN.md 开始执行，带多轮 developer-tester 循环
+
+        跳过 architect（已完成），执行:
+        tech_lead → developer ⇄ tester（循环）→ optimizer → security
+
+        Args:
+            plan_content: PLAN.md 的内容
+            existing_state: 现有状态（用于恢复时跳过已完成的 agent）
+
+        Returns:
+            True if successful, False if failed
+        """
+        start_time = time.time()
+
+        # 构建提示词（包含 PLAN.md 内容）
+        task_prompt = f"""
+请根据以下实施计划执行你的职责：
+
+{plan_content}
+
+---
+
+请严格按照计划执行，确保与其他 agents 的工作保持一致。
+"""
+
+        # 初始化或恢复状态
+        if existing_state:
+            state = existing_state
+            all_results = {}
+            current_round = state.get("current_round", 1)
+        else:
+            task_id = str(uuid.uuid4())
+            state = {
+                "task_id": task_id,
+                "user_request": "从 PLAN.md 执行（多轮模式）",
+                "complexity": "from_plan_loop",
+                "current_phase": 1,
+                "current_round": 1,
+                "agents_status": {"architect": "completed"},
+                "results": {},
+                "total_cost": 0.0,
+                "total_tokens": 0
+            }
+            all_results = {}
+            current_round = 1
+
+        # Phase 1: 执行 tech_lead（只执行一次）
+        if state.get("agents_status", {}).get("tech_lead") != "completed":
+            print(f"\n{'='*60}")
+            print(f"🔄 Phase 1: 技术审核")
+            print(f"{'='*60}\n")
+
+            config = self.scheduler.get_agent_config("tech_lead")
+            session_id = str(uuid.uuid4())
+
+            self.monitor.display_agent_start(config.name, session_id)
+
+            result = await self.error_handler.retry_with_backoff(
+                self.executor.run_agent,
+                config,
+                task_prompt,
+                session_id=session_id
+            )
+
+            self.monitor.display_agent_complete(result)
+            all_results["tech_lead"] = result
+
+            state["agents_status"]["tech_lead"] = result.status.value
+            result_dict = asdict(result)
+            result_dict["status"] = result.status.value
+            state["results"]["tech_lead"] = result_dict
+            self.state_manager.save_state(state)
+
+            if result.status == AgentStatus.FAILED:
+                print(f"\n❌ tech_lead 执行失败")
+                self._save_final_state(state, all_results, time.time() - start_time)
+                return False
+
+        # Phase 2: developer-tester 循环
+        while current_round <= self.max_rounds:
+            print(f"\n{'='*60}")
+            print(f"🔄 Round {current_round}/{self.max_rounds}: 开发和测试")
+            print(f"{'='*60}\n")
+
+            # 准备本轮的任务提示
+            round_prompt = task_prompt
+            if current_round > 1:
+                has_bugs, bug_summaries = self._check_bug_report()
+                if bug_summaries:
+                    bug_info = "\n".join(f"  - {b}" for b in bug_summaries[:10])
+                    round_prompt = f"""{task_prompt}
+
+---
+
+⚠️ 上一轮测试发现以下问题，请优先修复：
+
+{bug_info}
+
+请根据 BUG_REPORT.md 中的详细信息进行修复。
+"""
+
+            # 执行 developer
+            dev_key = f"developer_round{current_round}"
+            if state.get("agents_status", {}).get(dev_key) != "completed":
+                config = self.scheduler.get_agent_config("developer")
+                session_id = str(uuid.uuid4())
+
+                self.monitor.display_agent_start(f"developer (round {current_round})", session_id)
+
+                result = await self.error_handler.retry_with_backoff(
+                    self.executor.run_agent,
+                    config,
+                    round_prompt,
+                    session_id=session_id
+                )
+
+                self.monitor.display_agent_complete(result)
+                all_results[dev_key] = result
+
+                state["agents_status"][dev_key] = result.status.value
+                result_dict = asdict(result)
+                result_dict["status"] = result.status.value
+                state["results"][dev_key] = result_dict
+                self.state_manager.save_state(state)
+
+                if result.status == AgentStatus.FAILED:
+                    print(f"\n❌ developer (round {current_round}) 执行失败")
+                    self._save_final_state(state, all_results, time.time() - start_time)
+                    return False
+
+            # 执行 tester
+            tester_key = f"tester_round{current_round}"
+            if state.get("agents_status", {}).get(tester_key) != "completed":
+                config = self.scheduler.get_agent_config("tester")
+                session_id = str(uuid.uuid4())
+
+                self.monitor.display_agent_start(f"tester (round {current_round})", session_id)
+
+                result = await self.error_handler.retry_with_backoff(
+                    self.executor.run_agent,
+                    config,
+                    round_prompt,
+                    session_id=session_id
+                )
+
+                self.monitor.display_agent_complete(result)
+                all_results[tester_key] = result
+
+                state["agents_status"][tester_key] = result.status.value
+                result_dict = asdict(result)
+                result_dict["status"] = result.status.value
+                state["results"][tester_key] = result_dict
+                self.state_manager.save_state(state)
+
+                if result.status == AgentStatus.FAILED:
+                    print(f"\n❌ tester (round {current_round}) 执行失败")
+                    self._save_final_state(state, all_results, time.time() - start_time)
+                    return False
+
+            # 检查是否有未解决的 bug
+            has_bugs, bug_summaries = self._check_bug_report()
+
+            if not has_bugs:
+                print(f"\n✅ Round {current_round}: 没有发现未解决的 bug，继续执行后续阶段")
+                break
+
+            if current_round < self.max_rounds:
+                print(f"\n⚠️ Round {current_round}: 发现 {len(bug_summaries)} 个未解决的 bug")
+                print(f"   将进入 Round {current_round + 1} 进行修复...")
+                self._archive_bug_report(current_round)
+            else:
+                print(f"\n⚠️ 已达到最大循环次数 ({self.max_rounds})")
+                print(f"   仍有 {len(bug_summaries)} 个未解决的 bug，请手动检查 BUG_REPORT.md")
+
+            current_round += 1
+            state["current_round"] = current_round
+            self.state_manager.save_state(state)
+
+        # Phase 3: 执行 optimizer 和 security（只执行一次）
+        phase3_agents = ["optimizer", "security"]
+        print(f"\n{'='*60}")
+        print(f"🔄 Phase 3: 优化和安全检查")
+        print(f"{'='*60}\n")
+
+        for agent_name in phase3_agents:
+            if state.get("agents_status", {}).get(agent_name) == "completed":
+                print(f"⏭️ 跳过已完成: {agent_name}")
+                continue
+
+            config = self.scheduler.get_agent_config(agent_name)
+            session_id = str(uuid.uuid4())
+
+            self.monitor.display_agent_start(config.name, session_id)
+
+            result = await self.error_handler.retry_with_backoff(
+                self.executor.run_agent,
+                config,
+                task_prompt,
+                session_id=session_id
+            )
+
+            self.monitor.display_agent_complete(result)
+            all_results[config.name] = result
+
+            state["agents_status"][config.name] = result.status.value
+            result_dict = asdict(result)
+            result_dict["status"] = result.status.value
+            state["results"][config.name] = result_dict
+            self.state_manager.save_state(state)
+
+            if result.status == AgentStatus.FAILED:
+                print(f"\n❌ {config.name} 执行失败")
+                self._save_final_state(state, all_results, time.time() - start_time)
+                return False
+
+        # 完成
+        total_duration = time.time() - start_time
+        self._save_final_state(state, all_results, total_duration)
+        self.monitor.display_summary(all_results, total_duration)
+
+        print(f"\n   执行了 {current_round} 轮 developer-tester 循环")
+
+        return True
+
+    def _check_bug_report(self) -> Tuple[bool, List[str]]:
+        """
+        检查 BUG_REPORT.md 是否存在未解决的 bug
+
+        Returns:
+            (has_bugs, bug_summaries): 是否有bug，以及bug摘要列表
+        """
+        bug_file = self.project_root / "BUG_REPORT.md"
+
+        if not bug_file.exists():
+            return False, []
+
+        try:
+            content = bug_file.read_text(encoding='utf-8')
+        except (IOError, OSError):
+            return False, []
+
+        if not content.strip():
+            return False, []
+
+        # 解析 bug 列表
+        # 查找标记为未解决的 bug（常见格式：- [ ] bug描述 或 ❌ bug描述）
+        bug_summaries = []
+        lines = content.split('\n')
+
+        for line in lines:
+            line_stripped = line.strip()
+            # 匹配未勾选的复选框
+            if line_stripped.startswith('- [ ]') or line_stripped.startswith('* [ ]'):
+                bug_text = line_stripped[5:].strip()
+                if bug_text:
+                    bug_summaries.append(bug_text[:100])  # 限制长度
+            # 匹配带 ❌ 标记的行
+            elif '❌' in line_stripped and ('bug' in line_stripped.lower() or 'fail' in line_stripped.lower()):
+                bug_summaries.append(line_stripped[:100])
+            # 匹配 "Status: FAILED" 或类似标记
+            elif 'status:' in line_stripped.lower() and 'fail' in line_stripped.lower():
+                bug_summaries.append(line_stripped[:100])
+
+        has_bugs = len(bug_summaries) > 0
+        return has_bugs, bug_summaries
+
+    def _archive_bug_report(self, round_num: int) -> None:
+        """归档当前轮次的 BUG_REPORT.md"""
+        bug_file = self.project_root / "BUG_REPORT.md"
+        if bug_file.exists():
+            archive_file = self.project_root / f"BUG_REPORT_round{round_num}.md"
+            try:
+                import shutil
+                shutil.copy2(bug_file, archive_file)
+                print(f"📁 已归档 BUG_REPORT.md → BUG_REPORT_round{round_num}.md")
+            except (IOError, OSError) as e:
+                print(f"⚠️ 归档失败: {e}")
+
+    async def execute_with_loop(
+        self,
+        user_request: str,
+        clean_start: bool = True,
+        existing_state: Optional[Dict] = None
+    ) -> bool:
+        """
+        带多轮循环的执行模式
+
+        developer-tester 会循环执行，直到：
+        1. 没有未解决的 bug
+        2. 达到最大循环次数 (max_rounds)
+
+        Args:
+            user_request: 用户请求
+            clean_start: 是否清理旧状态
+            existing_state: 现有状态（恢复时使用）
+
+        Returns:
+            True if successful, False if failed
+        """
+        start_time = time.time()
+
+        # 清理旧状态
+        if clean_start:
+            self._cleanup_old_state()
+            print("🧹 已清理旧的状态文件\n")
+
+        # 解析任务复杂度
+        complexity = self.task_parser.parse_complexity(user_request)
+        print(f"📊 任务复杂度: {complexity.value}")
+
+        # 获取执行计划
+        phases = self.scheduler.plan_execution(complexity)
+
+        # 创建 feature 分支
+        feature_branch = self._create_feature_branch(user_request)
+
+        # 初始化状态
+        task_id = str(uuid.uuid4())
+        state = existing_state or {
+            "task_id": task_id,
+            "user_request": user_request,
+            "complexity": complexity.value,
+            "current_phase": 0,
+            "current_round": 1,
+            "agents_status": {},
+            "results": {},
+            "total_cost": 0.0,
+            "total_tokens": 0
+        }
+
+        all_results = {}
+
+        # Phase 1: 执行 architect 和 tech_lead（只执行一次）
+        phase1_agents = ["architect", "tech_lead"]
+        print(f"\n{'='*60}")
+        print(f"🔄 Phase 1: 规划和设计")
+        print(f"{'='*60}\n")
+
+        for agent_name in phase1_agents:
+            if state.get("agents_status", {}).get(agent_name) == "completed":
+                print(f"⏭️ 跳过已完成: {agent_name}")
+                continue
+
+            config = self.scheduler.get_agent_config(agent_name)
+            session_id = str(uuid.uuid4())
+
+            self.monitor.display_agent_start(config.name, session_id)
+
+            result = await self.error_handler.retry_with_backoff(
+                self.executor.run_agent,
+                config,
+                user_request,
+                session_id=session_id
+            )
+
+            self.monitor.display_agent_complete(result)
+            all_results[config.name] = result
+
+            # 更新状态
+            state["agents_status"][config.name] = result.status.value
+            result_dict = asdict(result)
+            result_dict["status"] = result.status.value
+            state["results"][config.name] = result_dict
+            self.state_manager.save_state(state)
+
+            if result.status == AgentStatus.FAILED:
+                print(f"\n❌ {config.name} 执行失败")
+                self._save_final_state(state, all_results, time.time() - start_time)
+                return False
+
+            # architect 完成后读取 PLAN.md
+            if agent_name == "architect":
+                plan_file = self.project_root / "PLAN.md"
+                if plan_file.exists():
+                    user_request = plan_file.read_text(encoding='utf-8')
+
+        # Phase 2: developer-tester 循环
+        current_round = state.get("current_round", 1)
+
+        while current_round <= self.max_rounds:
+            print(f"\n{'='*60}")
+            print(f"🔄 Round {current_round}/{self.max_rounds}: 开发和测试")
+            print(f"{'='*60}\n")
+
+            # 准备本轮的任务提示
+            round_prompt = user_request
+            if current_round > 1:
+                # 如果是第2轮+，附加上一轮的 bug 信息
+                has_bugs, bug_summaries = self._check_bug_report()
+                if bug_summaries:
+                    bug_info = "\n".join(f"  - {b}" for b in bug_summaries[:10])
+                    round_prompt = f"""{user_request}
+
+---
+
+⚠️ 上一轮测试发现以下问题，请优先修复：
+
+{bug_info}
+
+请根据 BUG_REPORT.md 中的详细信息进行修复。
+"""
+
+            # 执行 developer
+            dev_key = f"developer_round{current_round}"
+            if state.get("agents_status", {}).get(dev_key) != "completed":
+                config = self.scheduler.get_agent_config("developer")
+                session_id = str(uuid.uuid4())
+
+                self.monitor.display_agent_start(f"developer (round {current_round})", session_id)
+
+                result = await self.error_handler.retry_with_backoff(
+                    self.executor.run_agent,
+                    config,
+                    round_prompt,
+                    session_id=session_id
+                )
+
+                self.monitor.display_agent_complete(result)
+                all_results[dev_key] = result
+
+                state["agents_status"][dev_key] = result.status.value
+                result_dict = asdict(result)
+                result_dict["status"] = result.status.value
+                state["results"][dev_key] = result_dict
+                self.state_manager.save_state(state)
+
+                if result.status == AgentStatus.FAILED:
+                    print(f"\n❌ developer (round {current_round}) 执行失败")
+                    self._save_final_state(state, all_results, time.time() - start_time)
+                    return False
+
+            # 执行 tester
+            tester_key = f"tester_round{current_round}"
+            if state.get("agents_status", {}).get(tester_key) != "completed":
+                config = self.scheduler.get_agent_config("tester")
+                session_id = str(uuid.uuid4())
+
+                self.monitor.display_agent_start(f"tester (round {current_round})", session_id)
+
+                result = await self.error_handler.retry_with_backoff(
+                    self.executor.run_agent,
+                    config,
+                    round_prompt,
+                    session_id=session_id
+                )
+
+                self.monitor.display_agent_complete(result)
+                all_results[tester_key] = result
+
+                state["agents_status"][tester_key] = result.status.value
+                result_dict = asdict(result)
+                result_dict["status"] = result.status.value
+                state["results"][tester_key] = result_dict
+                self.state_manager.save_state(state)
+
+                if result.status == AgentStatus.FAILED:
+                    print(f"\n❌ tester (round {current_round}) 执行失败")
+                    self._save_final_state(state, all_results, time.time() - start_time)
+                    return False
+
+            # 检查是否有未解决的 bug
+            has_bugs, bug_summaries = self._check_bug_report()
+
+            if not has_bugs:
+                print(f"\n✅ Round {current_round}: 没有发现未解决的 bug，继续执行后续阶段")
+                break
+
+            if current_round < self.max_rounds:
+                print(f"\n⚠️ Round {current_round}: 发现 {len(bug_summaries)} 个未解决的 bug")
+                print(f"   将进入 Round {current_round + 1} 进行修复...")
+                # 归档本轮 bug 报告
+                self._archive_bug_report(current_round)
+            else:
+                print(f"\n⚠️ 已达到最大循环次数 ({self.max_rounds})")
+                print(f"   仍有 {len(bug_summaries)} 个未解决的 bug，请手动检查 BUG_REPORT.md")
+
+            current_round += 1
+            state["current_round"] = current_round
+            self.state_manager.save_state(state)
+
+        # Phase 3: 执行 optimizer 和 security（只执行一次）
+        phase3_agents = ["optimizer", "security"]
+        print(f"\n{'='*60}")
+        print(f"🔄 Phase 3: 优化和安全检查")
+        print(f"{'='*60}\n")
+
+        for agent_name in phase3_agents:
+            if state.get("agents_status", {}).get(agent_name) == "completed":
+                print(f"⏭️ 跳过已完成: {agent_name}")
+                continue
+
+            config = self.scheduler.get_agent_config(agent_name)
+            session_id = str(uuid.uuid4())
+
+            self.monitor.display_agent_start(config.name, session_id)
+
+            result = await self.error_handler.retry_with_backoff(
+                self.executor.run_agent,
+                config,
+                user_request,
+                session_id=session_id
+            )
+
+            self.monitor.display_agent_complete(result)
+            all_results[config.name] = result
+
+            state["agents_status"][config.name] = result.status.value
+            result_dict = asdict(result)
+            result_dict["status"] = result.status.value
+            state["results"][config.name] = result_dict
+            self.state_manager.save_state(state)
+
+            if result.status == AgentStatus.FAILED:
+                print(f"\n❌ {config.name} 执行失败")
+                self._save_final_state(state, all_results, time.time() - start_time)
+                return False
+
+        # 完成
+        total_duration = time.time() - start_time
+        self._save_final_state(state, all_results, total_duration)
+        self.monitor.display_summary(all_results, total_duration)
+
+        # 打印分支信息
+        if feature_branch:
+            print(f"\n{'='*60}")
+            print(f"✅ 任务完成！当前在分支: {feature_branch}")
+            print(f"   执行了 {current_round} 轮 developer-tester 循环")
+            print(f"{'='*60}\n")
 
         return True
 
@@ -1766,19 +2360,115 @@ def semi_auto_mode(project_root: Path, config: dict):
         return False
 
     # 创建 orchestrator 执行剩余 agents
+    max_rounds = config.get('max_rounds', 1)
     orchestrator = Orchestrator(
         project_root=project_root,
         max_budget=config['max_budget'],
         max_retries=config['max_retries'],
         verbose=config['verbose'],
-        interactive_architect=False  # architect 已完成
+        interactive_architect=False,  # architect 已完成
+        max_rounds=max_rounds
     )
 
     # 执行剩余阶段（跳过 architect）
     print(f"\n🚀 开始执行后续 Agents...")
-    success = asyncio.run(orchestrator.execute_from_plan(plan_content))
+    if max_rounds > 1:
+        print(f"   迭代模式: 最多 {max_rounds} 轮 developer-tester 循环")
+        success = asyncio.run(orchestrator.execute_from_plan_with_loop(plan_content))
+    else:
+        success = asyncio.run(orchestrator.execute_from_plan(plan_content))
 
     return success
+
+
+def from_plan_mode(project_root: Path, config: dict) -> bool:
+    """
+    从 PLAN.md 继续执行模式
+
+    用于以下场景：
+    - 用户已用其他 AI（如 GPT/Gemini/Grok）生成了 PLAN.md
+    - 用户想跳过 architect 阶段节省 token
+    - 直接执行 tech_lead 到 security 的后续 agents
+    """
+    plan_file = project_root / "PLAN.md"
+
+    # 检查 PLAN.md 是否存在
+    if not plan_file.exists():
+        print(f"\n❌ 未找到 PLAN.md 文件")
+        print(f"   请先生成计划文件：")
+        print(f"   - 使用模式 1（半自动模式）生成")
+        print(f"   - 或用其他 AI 生成后保存为 PLAN.md")
+        return False
+
+    # 读取 PLAN.md 内容
+    try:
+        with open(plan_file, 'r', encoding='utf-8', errors='replace') as f:
+            plan_content = f.read()
+    except (IOError, OSError) as e:
+        print(f"\n❌ 无法读取 PLAN.md: {e}")
+        return False
+
+    if not plan_content.strip():
+        print(f"\n⚠️ PLAN.md 文件为空，无法继续执行")
+        return False
+
+    # 显示 PLAN.md 预览
+    print(f"\n{'='*60}")
+    print(f"📋 检测到 PLAN.md")
+    print(f"   位置: {plan_file}")
+    print(f"{'='*60}")
+
+    print(f"\n--- PLAN.md 预览 ---")
+    preview = plan_content[:800]
+    print(preview)
+    if len(plan_content) > 800:
+        print("... (更多内容请查看文件)")
+    print(f"--- 预览结束 ---\n")
+
+    # 确认执行
+    confirm = input("确认跳过 Architect，执行后续 Agents？[Y/n] ").strip().lower()
+    if confirm in ['n', 'no', '否']:
+        print("已取消。")
+        return False
+
+    # 创建 orchestrator 执行剩余 agents
+    max_rounds = config.get('max_rounds', 1)
+    orchestrator = Orchestrator(
+        project_root=project_root,
+        max_budget=config['max_budget'],
+        max_retries=config['max_retries'],
+        verbose=config['verbose'],
+        interactive_architect=False,
+        max_rounds=max_rounds
+    )
+
+    print(f"\n🚀 开始执行后续 Agents（跳过 Architect）...")
+    print(f"   将执行: tech_lead → developer → tester → optimizer → security")
+    if max_rounds > 1:
+        print(f"   迭代模式: 最多 {max_rounds} 轮 developer-tester 循环")
+        success = asyncio.run(orchestrator.execute_from_plan_with_loop(plan_content))
+    else:
+        success = asyncio.run(orchestrator.execute_from_plan(plan_content))
+
+    return success
+
+
+def _ask_max_rounds() -> int:
+    """询问用户选择迭代轮数"""
+    print("""
+开发-测试迭代轮数：
+  1. 1轮（默认）- 线性执行，不循环
+  2. 2轮 - 如有bug，developer-tester再迭代1次
+  3. 3轮 - 最多迭代3次
+""")
+    rounds_choice = input("请选择 [1/2/3，直接回车=1]: ").strip()
+
+    if rounds_choice == '2':
+        return 2
+    elif rounds_choice == '3':
+        return 3
+    else:
+        return 1
 
 
 def interactive_mode(project_root: Path):
@@ -1788,10 +2478,12 @@ def interactive_mode(project_root: Path):
 ║       🚀 mc-dir - 多Agent智能调度系统                       ║
 ╚════════════════════════════════════════════════════════════╝
 
-选择模式：
+选择执行模式：
   1. 半自动模式（推荐）- 进入 Claude CLI 讨论需求，生成 PLAN.md 后自动执行
-  2. 传统交互模式 - 在此输入需求，预览后执行
-  3. 退出
+  2. 从 PLAN.md 继续 - 跳过 Architect，直接从现有计划执行（节省 token）
+  3. 全自动模式 - 输入任务后，Architect 自动规划并执行全流程
+  4. 传统交互模式 - 在此输入需求，可手动指定 agents
+  5. 退出
 """)
 
     # 默认配置
@@ -1799,10 +2491,21 @@ def interactive_mode(project_root: Path):
         'max_budget': 10.0,
         'max_retries': 3,
         'verbose': False,
-        'auto_architect': False
+        'auto_architect': False,
+        'max_rounds': 1
     }
 
-    choice = input("请选择 [1/2/3]: ").strip()
+    choice = input("请选择 [1/2/3/4/5]: ").strip()
+
+    if choice == '5':
+        print("\n👋 再见！")
+        return
+
+    # 模式 1/2/3 都需要询问迭代轮数
+    if choice in ['1', '2', '3', '']:
+        config['max_rounds'] = _ask_max_rounds()
+        if config['max_rounds'] > 1:
+            print(f"✓ 已设置: 最多 {config['max_rounds']} 轮 developer-tester 迭代\n")
 
     if choice == '1' or choice == '':
         # 半自动模式
@@ -1811,11 +2514,51 @@ def interactive_mode(project_root: Path):
             print("\n✅ 所有 Agents 执行完成！")
         return
 
-    if choice == '3':
-        print("\n👋 再见！")
+    if choice == '2':
+        # 从 PLAN.md 继续执行
+        success = from_plan_mode(project_root, config)
+        if success:
+            print("\n✅ 所有 Agents 执行完成！")
         return
 
-    # 传统交互模式
+    if choice == '3':
+        # 全自动模式
+        print("\n请输入任务描述（或 .md 文件路径）：")
+        task_input = input("> ").strip()
+        if not task_input:
+            print("❌ 任务不能为空")
+            return
+
+        # 如果是 .md 文件，读取内容
+        if task_input.endswith('.md'):
+            task_file = project_root / task_input
+            if task_file.exists():
+                with open(task_file, 'r', encoding='utf-8') as f:
+                    task_input = f.read()
+            else:
+                print(f"❌ 文件不存在: {task_file}")
+                return
+
+        orchestrator = Orchestrator(
+            project_root=project_root,
+            max_budget=config['max_budget'],
+            max_retries=config['max_retries'],
+            verbose=config['verbose'],
+            interactive_architect=False,  # 全自动
+            max_rounds=config['max_rounds']
+        )
+
+        print(f"\n🚀 全自动模式启动...")
+        if config['max_rounds'] > 1:
+            success = asyncio.run(orchestrator.execute_with_loop(task_input))
+        else:
+            success = asyncio.run(orchestrator.execute(task_input))
+
+        if success:
+            print("\n✅ 所有 Agents 执行完成！")
+        return
+
+    # 传统交互模式（选项 4）
     print("\n进入传统交互模式。输入 help 查看帮助，exit 退出。")
 
     while True:
@@ -1910,6 +2653,9 @@ def interactive_mode(project_root: Path):
                         print(f"✅ 自动规划: {'开启' if config['auto_architect'] else '关闭'}")
                 continue
 
+            # resume_mode 标志：用于后续执行时保留状态
+            resume_mode = False
+
             if cmd_lower == 'resume':
                 state_file = project_root / ".claude" / "state.json"
                 if state_file.exists():
@@ -1919,7 +2665,8 @@ def interactive_mode(project_root: Path):
                     confirm = input("是否恢复？[Y/n] ").strip().lower()
                     if confirm not in ['n', 'no', '否']:
                         user_input = state['user_request']
-                        # 继续执行
+                        resume_mode = True  # 标记为恢复模式，后续不清空状态
+                        # 继续执行（落入后续逻辑）
                     else:
                         continue
                 else:
@@ -2039,12 +2786,15 @@ def interactive_mode(project_root: Path):
                     interactive_architect=not auto_architect
                 )
 
-                success = asyncio.run(orchestrator.execute(user_input, clean_start=True))
+                success = asyncio.run(orchestrator.execute(user_input, clean_start=not resume_mode))
 
                 if success:
                     print("\n✅ 任务完成！可以继续输入新需求。")
                 else:
                     print("\n❌ 任务执行失败，请检查错误日志。")
+
+                # 重置 resume_mode 以便下次循环
+                resume_mode = False
 
         except KeyboardInterrupt:
             print("\n\n⚠️ 中断当前任务")
@@ -2108,13 +2858,62 @@ def main():
         action="store_true",
         help="全自动模式（跳过交互式规划）"
     )
+    parser.add_argument(
+        "--from-plan",
+        action="store_true",
+        help="从 PLAN.md 开始执行（跳过 architect，节省 token）"
+    )
+    parser.add_argument(
+        "--max-rounds",
+        type=int,
+        default=1,
+        help="developer-tester 循环最大轮数（默认1，即不循环）"
+    )
 
     args = parser.parse_args()
 
     # 获取项目根目录
     project_root = Path.cwd()
 
-    # 情景2：无参数时进入半自动模式
+    # --from-plan 模式：直接从 PLAN.md 开始
+    if args.from_plan:
+        plan_file = project_root / "PLAN.md"
+        if not plan_file.exists():
+            print(f"❌ PLAN.md 不存在，无法使用 --from-plan 模式")
+            print(f"   请先生成 PLAN.md 文件")
+            sys.exit(1)
+
+        try:
+            with open(plan_file, 'r', encoding='utf-8', errors='replace') as f:
+                plan_content = f.read()
+        except (IOError, OSError) as e:
+            print(f"❌ 无法读取 PLAN.md: {e}")
+            sys.exit(1)
+
+        if not plan_content.strip():
+            print(f"❌ PLAN.md 文件为空")
+            sys.exit(1)
+
+        print(f"📋 从 PLAN.md 开始执行（跳过 Architect）")
+        orchestrator = Orchestrator(
+            project_root=project_root,
+            max_budget=args.max_budget,
+            max_retries=args.max_retries,
+            verbose=args.verbose,
+            interactive_architect=False
+        )
+
+        try:
+            success = asyncio.run(orchestrator.execute_from_plan(plan_content))
+            if success:
+                print("\n✅ 所有 Agents 执行完成！")
+            sys.exit(0 if success else 1)
+        except KeyboardInterrupt:
+            print("\n\n⚠️ 用户中断执行")
+            print("   状态已保存，可使用 --resume 恢复")
+            sys.exit(130)
+
+    # 无参数时进入半自动模式
     if not args.request and not args.resume:
         interactive_mode(project_root)
         return
@@ -2137,7 +2936,8 @@ def main():
         max_budget=args.max_budget,
         max_retries=args.max_retries,
         verbose=args.verbose,
-        interactive_architect=not args.auto_architect
+        interactive_architect=not args.auto_architect,
+        max_rounds=args.max_rounds
     )
 
     # 恢复模式
@@ -2171,7 +2971,15 @@ def main():
     # 执行
     try:
         # resume 模式不清理旧状态，新任务则清理
-        success = asyncio.run(orchestrator.execute(user_request, clean_start=not args.resume))
+        clean_start = not args.resume
+
+        # 如果 max_rounds > 1，使用带循环的执行模式
+        if args.max_rounds > 1:
+            print(f"🔄 多轮循环模式: 最多 {args.max_rounds} 轮 developer-tester 迭代")
+            success = asyncio.run(orchestrator.execute_with_loop(user_request, clean_start=clean_start))
+        else:
+            success = asyncio.run(orchestrator.execute(user_request, clean_start=clean_start))
+
         sys.exit(0 if success else 1)
     except KeyboardInterrupt:
         print("\n\n⚠️ 用户中断执行")
