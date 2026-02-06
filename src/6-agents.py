@@ -637,11 +637,20 @@ class AgentExecutor:
         # 从 metadata 中获取 model（如果有的话）
         agent_model = metadata.get('model', 'sonnet')
 
-        # 构建claude命令
+        # Windows 命令行长度限制修复（WinError 206）：
+        # 当 task_prompt 过长时，写入临时文件让 agent 通过 Read 工具读取
+        prompt_temp_file = None
+        actual_prompt = task_prompt
+        if len(task_prompt) > 4000:
+            prompt_temp_file = self.project_root / ".claude" / f"prompt_{config.name}_{session_id[:8]}.txt"
+            prompt_temp_file.parent.mkdir(parents=True, exist_ok=True)
+            prompt_temp_file.write_text(task_prompt, encoding='utf-8')
+            actual_prompt = f"请先使用 Read 工具读取文件 `{prompt_temp_file}` 获取完整任务指令，然后严格按照指令执行你的职责。"
+
         # 构建 claude 命令
         # 注意：architect 使用 plan 模式（只读），其他 agents 使用 skip-permissions（可写）
         cmd = [
-            "claude", "-p", task_prompt,
+            "claude", "-p", actual_prompt,
             "--append-system-prompt", role_prompt,
             "--output-format", "stream-json",
             "--verbose",
@@ -781,6 +790,13 @@ class AgentExecutor:
                 output_files=[],
                 error_message=str(e)
             )
+          finally:
+            # 清理临时 prompt 文件
+            if prompt_temp_file and prompt_temp_file.exists():
+                try:
+                    prompt_temp_file.unlink()
+                except (OSError, PermissionError):
+                    pass
 
     def run_agent_interactive(
         self,
@@ -1935,16 +1951,11 @@ class Orchestrator:
             print("✅ 所有 agents 已完成，无需继续执行")
             return True
 
-        # 构建提示词（包含 PLAN.md 内容）
+        # 构建提示词（引用 PLAN.md 而非嵌入全文，避免 Windows 命令行长度限制）
         progress_info = ""
         if self.progress_file:
             progress_info = f"\n📝 完成任务后，请更新进度文件: `{self.progress_file.name}`\n"
-        task_prompt = f"""
-请根据以下实施计划执行你的职责：
-
-{plan_content}
-
----
+        task_prompt = f"""请使用 Read 工具读取项目根目录的 `PLAN.md` 文件，然后根据实施计划执行你的职责。
 
 请严格按照计划执行，确保与其他 agents 的工作保持一致。
 {progress_info}"""
@@ -2057,16 +2068,11 @@ class Orchestrator:
         self.progress_file = self._init_progress_file()
         print(f"📝 进度文件: {self.progress_file.name}", flush=True)
 
-        # 构建提示词（包含 PLAN.md 内容）
+        # 构建提示词（引用 PLAN.md 而非嵌入全文，避免 Windows 命令行长度限制）
         progress_info = ""
         if self.progress_file:
             progress_info = f"\n📝 完成任务后，请更新进度文件: `{self.progress_file.name}`\n"
-        task_prompt = f"""
-请根据以下实施计划执行你的职责：
-
-{plan_content}
-
----
+        task_prompt = f"""请使用 Read 工具读取项目根目录的 `PLAN.md` 文件，然后根据实施计划执行你的职责。
 
 请严格按照计划执行，确保与其他 agents 的工作保持一致。
 {progress_info}"""
@@ -2978,47 +2984,8 @@ def semi_auto_mode(project_root: Path, config: dict):
         print(f"   文件路径: {plan_file}")
         print(f"   请检查文件是否存在且可读\n")
 
-    # === 阶段1: 提供计划审核/编辑选项 ===
-    print(f"\n{'='*60}")
-    print(f"📝 计划审核")
-    print(f"{'='*60}")
-    print(f"选项：")
-    print(f"  Y/y/是  - 打开编辑器查看/修改 PLAN.md")
-    print(f"  n/否    - 跳过编辑，直接进入执行确认")
-    print(f"  q/退出  - 取消执行，稍后使用模式2继续")
-
-    review_choice = input("\n是否查看/编辑 PLAN.md？[Y/n/q] ").strip().lower()
-
-    if review_choice in ['q', '退出', 'quit']:
-        print("\n已取消。你可以：")
-        print(f"  1. 手动编辑 PLAN.md: {plan_file}")
-        print(f"  2. 使用模式 2（从 PLAN.md 继续）重新运行")
-        return False
-
-    if review_choice not in ['n', 'no', '否']:
-        # 打开编辑器让用户查看/编辑
-        _open_file_in_editor(plan_file)
-        print(f"\n✅ 编辑器已关闭。")
-
-        # 重新读取 PLAN.md 显示更新后的预览
-        try:
-            with open(plan_file, 'r', encoding='utf-8', errors='replace') as f:
-                preview = f.read(500)
-            print(f"\n--- 更新后的 PLAN.md 预览 ---")
-            print(preview)
-            if len(preview) >= 500:
-                print("... (更多内容请查看文件)")
-            print(f"--- 预览结束 ---\n")
-        except (IOError, OSError, UnicodeDecodeError) as e:
-            print(f"\n⚠️ 重新读取 PLAN.md 失败: {e}")
-
-    # === 阶段2: 最终执行确认 ===
-    confirm = input("确认执行后续 Agents？[Y/n] ").strip().lower()
-    if confirm in ['n', 'no', '否']:
-        print("\n已取消。你可以：")
-        print(f"  1. 继续修改 PLAN.md: {plan_file}")
-        print(f"  2. 使用模式 2（从 PLAN.md 继续）重新运行")
-        return False
+    # 直接读取 PLAN.md 并执行后续 agents（跳过编辑/确认步骤）
+    print(f"\n🚀 自动进入执行阶段...")
 
     # 读取 PLAN.md 作为任务描述（带容错）
     try:

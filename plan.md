@@ -2190,3 +2190,145 @@ Plan Mode 架构盲区导致的三个问题：
 本次工作不仅发现并分析了4个关键 Bug，还从元层面优化了整个多 Agent 系统的架构设计，为系统的长期稳定性和可维护性打下了基础。
 
 下一步：请用户输入 `/exit` 退出 Architect 会话，启动后续 agents 执行修复计划。
+
+---
+
+# 2026-02-06 第二轮全面测试与Debug计划（Architect 第二次会话）
+
+## 任务背景
+
+用户要求继续对 `src/6-agents.py` 进行全面测试和debug。上一轮已修复 Bug #0-#10。
+本次通过完整代码审查（3775行），发现 10 个新 Bug + 1 个系统级 Bug 重现。
+
+---
+
+## 发现的新 Bug（共 11 个）
+
+### Bug #8 重现！Architect 越权执行（系统级 Bug）
+
+**严重程度**: P0（系统级）
+**发现方式**: 实战中再次触发
+
+**问题现象**：
+- ExitPlanMode 批准后，Architect **立即尝试创建 TaskCreate** 准备执行修复任务
+- 这正是 Bug #8 的重现 — 尽管 01-arch.md 已添加了 Plan Mode 特别提醒
+
+**根因分析**：
+1. 上一轮的 Bug #8 修复（在 01-arch.md 添加提醒文字）**不够有效**
+2. ExitPlanMode 批准后系统提示 "You can now make edits" **诱导性太强**
+3. Architect agent 在新会话中**没有读取** 01-arch.md 的限制章节（因为 Plan Mode 下 Architect 是主进程，不经过 AgentExecutor 的 prompt 注入流程）
+4. **三重防护机制的盲区依然存在**：
+   - 防护1（Prompt 强化）：仅在 `run_agent()` 中注入，Plan Mode 不经过此路径 ❌
+   - 防护2（实时流监控）：仅监控子进程 stdout，Plan Mode 无子进程 ❌
+   - 防护3（后置回滚）：仅在 `execute()`/`execute_with_loop()` 中调用 ❌
+
+**修复建议**（优先级从高到低）：
+1. **强化 01-arch.md 开头位置**：将"Plan Mode 下禁止执行"提示从文件末尾移到**文件最开头**（LLM 对开头内容权重更高）
+2. **在 CLAUDE.md 中添加全局规则**：所有 agent prompt 文件的开头必须声明职责边界
+3. **系统层面**：考虑在 `interactive_mode()` 的模式1（半自动）流程中，Architect claude 进程退出后立即加一层确认："Architect 已完成规划，是否继续执行后续 agents？"
+
+---
+
+### P0 (Critical) — 代码级 Bug
+
+| Bug | 位置 | 描述 |
+|-----|------|------|
+| **#11** | `execute_with_loop()` L2402-2444 | Phase 1 硬编码 `["architect", "tech_lead"]`，MINIMAL 复杂度应跳过但仍会执行 |
+| **#12** | `execute_with_loop()` L2556-2591 | Phase 3 硬编码 `["optimizer", "security"]`，MINIMAL 复杂度仍会执行 |
+| **#20** | `execute()` L1780-1808 | 并行子分支隔离竞态条件：`git checkout -b` 是 repo 全局操作，并发执行时后创建的分支覆盖前一个 |
+| **#22** | `_cleanup_temp_agent_files()` L1260-1272 | 清理函数删除 `BUG_REPORT_round*.md` 归档文件，导致多轮测试的诊断信息全部丢失 |
+
+### P1 (Important)
+
+| Bug | 位置 | 描述 |
+|-----|------|------|
+| **#14** | `interactive_mode()` L3205-3222 | 模式1/2询问了复杂度但 `semi_auto_mode()` 和 `from_plan_mode()` 未传递给 Orchestrator |
+| **#18** | `execute_from_plan()` L1989 | 所有 agent 串行执行，未按 scheduler 规划的并行 phase 分组 |
+| **#23** | `execute_with_loop()` L2461 | dev/tester 的 prompt 直接用 `user_request + progress_suffix`，绕过了 `generate_initial_prompt()` 的路径指令和 repo-scan 信息注入 |
+
+### P2 (Minor)
+
+| Bug | 位置 | 描述 |
+|-----|------|------|
+| **#17** | `_select_account()` L3562-3583 | while True 循环无退出选项，若两个账户目录都不存在则死循环 |
+| **#24** | `interactive_mode()` L3490-3496 | 模式4 自动规划模式创建 Orchestrator 时未传 `max_rounds` |
+| **#26** | `semi_auto_mode()` L2878-2885 | frontmatter 解析用简单 `split('---', 2)`，与 AgentExecutor 的多正则解析不一致 |
+
+---
+
+## Bug 修复方案摘要
+
+### Bug #11 & #12: `execute_with_loop()` 忽略复杂度
+**修复**: 使用 `self.scheduler.plan_execution(complexity)` 的结果来决定执行哪些 agent，而非硬编码 phase 列表。将 phases 拆分为 pre_loop / loop / post_loop 三组。
+
+### Bug #20: 并行分支隔离竞态
+**推荐方案**: 删除并行场景的子分支隔离逻辑，保留串行的 feature branch。理由：并行 agent（tester+security+optimizer）生成的文件不重叠，无需分支隔离。
+
+### Bug #22: cleanup 删除归档
+**修复**: 从 `_cleanup_temp_agent_files()` 中移除 `BUG_REPORT_round*.md` 的 glob 删除逻辑。
+
+### Bug #14: 模式1/2 不传递复杂度
+**修复**: `semi_auto_mode()` 和 `from_plan_mode()` 接收并使用 config 中的 complexity 参数。
+
+### Bug #18: execute_from_plan 串行执行
+**修复**: 参照 `execute()` 的结构，使用 scheduler 的 phase 分组来支持并行执行。
+
+### Bug #23: execute_with_loop prompt 绕过
+**修复**: 在 dev/tester 轮次中使用 `generate_initial_prompt()` 而非直接拼接字符串。
+
+### Bug #17: _select_account 无退出
+**修复**: 添加 'q'/'quit'/'exit' 退出选项。
+
+### Bug #24: 模式4 缺少 max_rounds
+**修复**: L3490 Orchestrator 构造函数添加 `max_rounds=config['max_rounds']`。
+
+### Bug #26: frontmatter 解析不一致
+**修复**: `semi_auto_mode()` 中调用 `AgentExecutor._parse_agent_file()` 替代手动 split。
+
+### Bug #8 重现: Architect 越权
+**修复**: 将 01-arch.md 的 Plan Mode 限制提示移到文件最开头；在 CLAUDE.md 添加全局规则。
+
+---
+
+## 测试计划
+
+### 新增测试文件结构
+```
+tests/
+  conftest.py                          # 扩展：添加 _import_agents_module, mock fixtures
+  unit/
+    test_orchestrator_unit.py          # NEW - _init_progress_file, _check_bug_report 等
+    test_progress_monitor.py           # NEW - 输出格式验证
+    test_branch_management.py          # NEW - Git 操作 mock 测试
+    test_architect_validation.py       # NEW - 越权检测逻辑
+    test_cli_functions.py              # NEW - find_project_root, _ask_max_rounds 等
+  integration/
+    __init__.py                        # NEW
+    test_execute_flow.py               # NEW - execute() 全流程 (mock claude)
+    test_execute_with_loop.py          # NEW - 多轮循环测试
+    test_execute_from_plan.py          # NEW - 从 PLAN.md 执行测试
+    test_execute_manual.py             # NEW - 手动模式测试
+  regression/
+    __init__.py                        # NEW
+    test_bug_11_12_complexity.py       # NEW - 复杂度忽略验证
+    test_bug_20_branch_race.py         # NEW - 分支竞态验证
+    test_bug_22_cleanup_archives.py    # NEW - 归档清理验证
+    test_bug_23_prompt_bypass.py       # NEW - prompt 构造验证
+    test_bug_14_mode_complexity.py     # NEW - 模式复杂度传递
+    test_bug_17_select_account.py      # NEW - 账户选择退出
+```
+
+### 预期: 新增 ~60 个测试，总计 ~125 个，覆盖率从 ~25% 提升到 ~55-65%
+
+---
+
+## 执行步骤（由其他 agents 完成）
+
+1. **Developer**: 修复 Bug #11/#12/#20/#22（P0）→ 修复 Bug #14/#18/#23（P1）→ 修复 Bug #17/#24/#26（P2）
+2. **Developer**: 修复 Bug #8 重现（修改 01-arch.md 和 CLAUDE.md）
+3. **Tester**: 编写所有测试文件并执行
+4. **用户**: 验证修复效果，提交代码
+
+---
+
+**Architect 任务完成。** 下一步：请用户输入 `/exit`，然后启动 Developer 和 Tester agents 执行修复和测试。
