@@ -26,7 +26,7 @@ class TestManualModeDetection:
         import importlib.util
         spec = importlib.util.spec_from_file_location(
             "six_agents",
-            Path(__file__).parent.parent.parent / "src" / "6-agents.py"
+            Path(__file__).parent.parent.parent / "src" / "orchestrator_v6.py"
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -64,7 +64,7 @@ class TestAgentNameResolution:
         import importlib.util
         spec = importlib.util.spec_from_file_location(
             "six_agents",
-            Path(__file__).parent.parent.parent / "src" / "6-agents.py"
+            Path(__file__).parent.parent.parent / "src" / "orchestrator_v6.py"
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -117,7 +117,7 @@ class TestTaskParsing:
         import importlib.util
         spec = importlib.util.spec_from_file_location(
             "six_agents",
-            Path(__file__).parent.parent.parent / "src" / "6-agents.py"
+            Path(__file__).parent.parent.parent / "src" / "orchestrator_v6.py"
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)

@@ -13,14 +13,14 @@
 D:/Technique Support/Claude Code Learning/2nd-repo/  ← Repo 根目录（.git 在这里）
 ├── .git/
 ├── src/
-│   └── 6-agents.py                                  ← 代码在这里
+│   └── orchestrator_v6.py                                  ← 代码在这里
 ├── plan.md                                          ← 在 repo 根目录
 ├── repo-scan-result.md                              ← 在 repo 根目录
 └── .claude/                                         ← 在 repo 根目录
 ```
 
 **关键问题**：
-- ❌ **不要**在 `src/` 目录下运行 `python 6-agents.py`
+- ❌ **不要**在 `src/` 目录下运行 `python orchestrator_v6.py`
 - ✅ **应该**在 repo 根目录运行，或者确保代码使用 `find_project_root()` 而非 `Path.cwd()`
 - ⚠️ 如果在 `src/` 运行，`Path.cwd()` 会返回 `src/`，导致找不到 `plan.md`、`repo-scan-result.md` 等文件
 
@@ -92,8 +92,8 @@ Write(
 ```python
 # Plan Mode 批准后，尝试执行修复
 Bash(command="git checkout -b fix/bug-7-repo-scan")
-Read(file_path="src/6-agents.py")  # 准备修改代码
-Edit(file_path="src/6-agents.py", ...)  # 修改源代码
+Read(file_path="src/orchestrator_v6.py")  # 准备修改代码
+Edit(file_path="src/orchestrator_v6.py", ...)  # 修改源代码
 ```
 
 **✅ 正确示范**：

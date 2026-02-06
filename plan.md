@@ -2331,4 +2331,291 @@ tests/
 
 ---
 
+## Tech Lead 审核
+
+### 审核状态：✅ 通过（附条件）
+
+### 审核意见
+
+**总体评价**：
+- ✅ 计划结构清晰，Bug 分类合理（P0/P1/P2）
+- ✅ 修复方案描述具体，每个 Bug 都有明确的代码位置
+- ✅ 测试计划完善，包含单元测试、集成测试和回归测试
+- ⚠️ 任务粒度过大，需要进一步分解
+
+**检查结果**：
+
+| 检查项 | 状态 | 说明 |
+|--------|------|------|
+| 文件列表 | ✅ 通过 | 所有涉及文件已明确标注（src/6-agents.py, .claude/agents/01-arch.md, CLAUDE.md） |
+| 实施步骤 | ⚠️ 需细化 | 大步骤已明确，但需分解为更小的子任务 |
+| 依赖关系 | ✅ 通过 | Bug 修复优先级明确（P0→P1→P2），测试依赖修复完成 |
+| 风险评估 | ✅ 通过 | Bug #20（竞态条件）和 Bug #8（系统级 Bug）已有风险说明和推荐方案 |
+
+**关键发现**：
+1. **P0 Bug #11/#12** 影响复杂度功能，必须优先修复
+2. **P0 Bug #20** 涉及并发竞态，修复方案合理（删除并行分支隔离）
+3. **Bug #8 重现** 是系统级问题，需要修改 agent prompt 文件结构
+4. **测试覆盖率提升** 从 25% → 55-65% 是合理目标
+
+---
+
+### 任务分解
+
+#### Phase 1: P0 级别 Bug 修复（关键路径）
+
+**Task 1.1: 修复 Bug #11 & #12 - execute_with_loop() 复杂度忽略**
+- 文件：`src/6-agents.py:2402-2444` (Phase 1) 和 `L2556-2591` (Phase 3)
+- 预计时间：20-25 分钟
+- 具体步骤：
+  1. 在 `execute_with_loop()` 开头调用 `phases = self.scheduler.plan_execution(complexity)`
+  2. 将 phases 拆分为 `pre_loop_agents`、`loop_agents`、`post_loop_agents`
+  3. Phase 1：用 `pre_loop_agents` 替换硬编码的 `["architect", "tech_lead"]`
+  4. Phase 2：保留 loop_agents（dev/tester）逻辑不变
+  5. Phase 3：用 `post_loop_agents` 替换硬编码的 `["optimizer", "security"]`
+  6. 添加空列表检查，避免空 phase 执行
+- 验证方式：
+  - MINIMAL 复杂度时，Phase 1/3 应跳过
+  - COMPLEX 复杂度时，所有 phases 正常执行
+
+**Task 1.2: 修复 Bug #20 - 并行分支隔离竞态**
+- 文件：`src/6-agents.py:1780-1808`
+- 预计时间：15-20 分钟
+- 具体步骤：
+  1. 找到 `execute()` 中处理 `agent_isolation_mode` 的代码段
+  2. 删除 `if is_parallel and self.agent_isolation_mode == "branch":` 分支
+  3. 保留串行场景的 feature branch 创建逻辑
+  4. 更新注释，说明并行 agent 不使用分支隔离的原因
+- 验证方式：
+  - 并行执行时不创建子分支
+  - 串行执行时仍然创建 feature branch
+
+**Task 1.3: 修复 Bug #22 - cleanup 删除归档文件**
+- 文件：`src/6-agents.py:1260-1272`
+- 预计时间：10 分钟
+- 具体步骤：
+  1. 找到 `_cleanup_temp_agent_files()` 函数
+  2. 定位 `BUG_REPORT_round*.md` 的 glob 删除逻辑
+  3. 删除该行代码或添加条件跳过归档文件
+  4. 确保其他临时文件仍正常清理
+- 验证方式：
+  - 多轮测试后 `BUG_REPORT_round*.md` 文件保留
+  - 其他临时文件（TASK.md, PROGRESS.md 等）正常清理
+
+#### Phase 2: P1 级别 Bug 修复（重要）
+
+**Task 2.1: 修复 Bug #14 - 模式1/2 不传递复杂度**
+- 文件：`src/6-agents.py:3205-3222` (interactive_mode)、`semi_auto_mode()`、`from_plan_mode()`
+- 预计时间：20 分钟
+- 具体步骤：
+  1. 在 `interactive_mode()` 中，将用户选择的 `task_complexity` 加入 config 字典
+  2. 修改 `semi_auto_mode()` 签名，接收 `override_complexity: Optional[TaskComplexity] = None`
+  3. 修改 `from_plan_mode()` 签名，接收 `override_complexity: Optional[TaskComplexity] = None`
+  4. 在两个函数中创建 Orchestrator 时传递 `override_complexity`
+- 验证方式：
+  - 模式1/2 选择 MINIMAL 时，只执行 dev+tester
+  - 模式1/2 选择 COMPLEX 时，执行全流程
+
+**Task 2.2: 修复 Bug #18 - execute_from_plan 串行执行**
+- 文件：`src/6-agents.py:1989` (execute_from_plan)
+- 预计时间：25-30 分钟
+- 具体步骤：
+  1. 参考 `execute()` 的并行执行逻辑（L1600-1700）
+  2. 在 `execute_from_plan()` 中调用 `self.scheduler.plan_execution(complexity)`
+  3. 遍历 phases，对每个 phase 的 agents 使用 `asyncio.gather()` 并行执行
+  4. 保留 phase 之间的串行顺序（等待上一个 phase 完成）
+  5. 添加进度输出，显示当前 phase 信息
+- 验证方式：
+  - 同一 phase 内的 agents 并行执行
+  - 不同 phase 之间串行执行
+
+**Task 2.3: 修复 Bug #23 - execute_with_loop prompt 绕过**
+- 文件：`src/6-agents.py:2461`
+- 预计时间：15 分钟
+- 具体步骤：
+  1. 找到 dev/tester 循环中的 prompt 构造代码
+  2. 替换 `user_request + progress_suffix` 为调用 `self.generate_initial_prompt()`
+  3. 确保传递正确的参数（user_request, agent_name, round_num）
+  4. 验证 repo-scan 信息和路径指令是否注入
+- 验证方式：
+  - dev/tester 收到的 prompt 包含 repo-scan 结果
+  - 包含正确的路径指令（相对路径、正斜杠）
+
+#### Phase 3: P2 级别 Bug 修复（次要）
+
+**Task 3.1: 修复 Bug #17 - _select_account 无退出选项**
+- 文件：`src/6-agents.py:3562-3583`
+- 预计时间：10 分钟
+- 具体步骤：
+  1. 在 `_select_account()` 的选项中添加 'q' / 'quit' / 'exit'
+  2. 用户输入这些选项时，返回 None 或抛出退出异常
+  3. 在调用处添加 None 检查，优雅退出程序
+- 验证方式：
+  - 输入 'q' 时程序退出，不继续循环
+
+**Task 3.2: 修复 Bug #24 - 模式4 缺少 max_rounds**
+- 文件：`src/6-agents.py:3490-3496`
+- 预计时间：5 分钟
+- 具体步骤：
+  1. 找到模式4创建 Orchestrator 的代码行（L3490）
+  2. 在构造函数参数中添加 `max_rounds=config['max_rounds']`
+- 验证方式：
+  - 模式4 的多轮执行次数受 max_rounds 限制
+
+**Task 3.3: 修复 Bug #26 - frontmatter 解析不一致**
+- 文件：`src/6-agents.py:2878-2885`
+- 预计时间：10 分钟
+- 具体步骤：
+  1. 在 `semi_auto_mode()` 中定位 frontmatter 解析代码
+  2. 替换 `split('---', 2)` 为调用 `AgentExecutor._parse_agent_file()`
+  3. 提取 frontmatter 和 content 部分
+  4. 确保与其他地方的解析逻辑一致
+- 验证方式：
+  - 复杂的 PLAN.md 格式（多个 `---` 分隔符）解析正确
+
+#### Phase 4: 系统级 Bug 修复（Bug #8 重现）
+
+**Task 4.1: 修改 01-arch.md - 移动 Plan Mode 限制到开头**
+- 文件：`.claude/agents/01-arch.md`
+- 预计时间：10 分钟
+- 具体步骤：
+  1. 找到文件末尾的 "⚠️ Plan Mode 特别提醒" 章节
+  2. 剪切整个章节（包括所有子内容）
+  3. 粘贴到文件开头（第一个 `#` 标题之前或紧跟其后）
+  4. 增强警告语气，使用 **加粗** 和 🚨 emoji
+- 验证方式：
+  - Architect agent 在 Plan Mode 下不尝试执行代码修改
+
+**Task 4.2: 更新 CLAUDE.md - 添加全局 Agent 职责规则**
+- 文件：`CLAUDE.md`
+- 预计时间：10 分钟
+- 具体步骤：
+  1. 在 CLAUDE.md 的 "关键规则" 部分添加新章节
+  2. 标题：`### Agent 职责边界（6-agents 系统）`
+  3. 内容：
+     - 所有 agent prompt 文件必须在开头声明职责边界
+     - Plan Mode 下 Architect 只能写 PLAN.md，不能执行代码修改
+     - 引用 01-arch.md 作为标准模板
+  4. 添加到 "已知问题与解决方案" 部分，记录 Bug #8 的教训
+- 验证方式：
+  - 开发者查看 CLAUDE.md 时能快速了解 agent 限制
+
+#### Phase 5: 测试编写（由 Tester Agent 完成）
+
+**Task 5.1: 编写 P0 Bug 回归测试**
+- 文件：`tests/regression/test_bug_11_12_complexity.py`、`test_bug_20_branch_race.py`、`test_bug_22_cleanup_archives.py`
+- 预计时间：30 分钟
+- 具体步骤：
+  1. 为 Bug #11/#12 编写测试，验证不同复杂度下 phase 执行情况
+  2. 为 Bug #20 编写测试，验证并行场景不创建子分支
+  3. 为 Bug #22 编写测试，验证归档文件不被清理
+- 测试数量：~15 个测试用例
+
+**Task 5.2: 编写 P1 Bug 回归测试**
+- 文件：`tests/regression/test_bug_14_mode_complexity.py`、`test_bug_23_prompt_bypass.py`
+- 预计时间：25 分钟
+- 具体步骤：
+  1. 为 Bug #14 编写测试，验证模式1/2的复杂度传递
+  2. 为 Bug #23 编写测试，验证 prompt 包含 repo-scan 信息
+- 测试数量：~10 个测试用例
+
+**Task 5.3: 编写 P2 Bug 回归测试**
+- 文件：`tests/regression/test_bug_17_select_account.py`
+- 预计时间：10 分钟
+- 具体步骤：
+  1. 为 Bug #17 编写测试，验证退出选项功能
+- 测试数量：~3 个测试用例
+
+**Task 5.4: 编写集成测试**
+- 文件：`tests/integration/test_execute_flow.py`、`test_execute_with_loop.py`、`test_execute_from_plan.py`
+- 预计时间：45 分钟
+- 具体步骤：
+  1. 测试 execute() 的完整流程（mock claude 调用）
+  2. 测试 execute_with_loop() 的多轮循环
+  3. 测试 execute_from_plan() 的 PLAN.md 执行
+- 测试数量：~20 个测试用例
+
+**Task 5.5: 编写单元测试**
+- 文件：`tests/unit/test_orchestrator_unit.py`、`test_progress_monitor.py`、`test_branch_management.py`、`test_architect_validation.py`、`test_cli_functions.py`
+- 预计时间：30 分钟
+- 具体步骤：
+  1. 测试 Orchestrator 的辅助函数（_init_progress_file, _check_bug_report 等）
+  2. 测试 ProgressMonitor 的输出格式
+  3. 测试 Git 分支管理逻辑
+  4. 测试 Architect 越权检测
+  5. 测试 CLI 辅助函数
+- 测试数量：~12 个测试用例
+
+---
+
+### 任务依赖关系图
+
+```
+Phase 1 (P0 Bug 修复)
+  ├─ Task 1.1 (Bug #11/#12) ─┐
+  ├─ Task 1.2 (Bug #20)      ├──► Phase 2 (P1 Bug 修复)
+  └─ Task 1.3 (Bug #22)      │     ├─ Task 2.1 (Bug #14)
+                              │     ├─ Task 2.2 (Bug #18)
+                              │     └─ Task 2.3 (Bug #23)
+                              │            │
+                              │            ▼
+                              │     Phase 3 (P2 Bug 修复)
+                              │       ├─ Task 3.1 (Bug #17)
+                              │       ├─ Task 3.2 (Bug #24)
+                              │       └─ Task 3.3 (Bug #26)
+                              │            │
+                              │            ▼
+                              │     Phase 4 (系统级 Bug)
+                              │       ├─ Task 4.1 (01-arch.md)
+                              │       └─ Task 4.2 (CLAUDE.md)
+                              │
+                              └──────────────► Phase 5 (测试)
+                                                ├─ Task 5.1 (P0 测试)
+                                                ├─ Task 5.2 (P1 测试)
+                                                ├─ Task 5.3 (P2 测试)
+                                                ├─ Task 5.4 (集成测试)
+                                                └─ Task 5.5 (单元测试)
+```
+
+**关键路径**：Phase 1 → Phase 2 → Phase 5（P0 和 P1 必须修复后再测试）
+**可并行**：Phase 3 和 Phase 4 可在 Phase 2 完成后并行进行
+
+---
+
+### 风险评估与应对
+
+| 风险 | 概率 | 影响 | 应对方案 |
+|------|------|------|----------|
+| Bug #11/#12 修复影响其他流程 | 中 | 高 | 修复后立即运行现有测试套件，确保无回归 |
+| Bug #20 并行逻辑删除后性能下降 | 低 | 中 | 监控并行执行时间，如有问题改用进程级隔离 |
+| Bug #8 Prompt 修改不生效 | 中 | 高 | 在测试环境验证 Architect 行为，必要时添加系统级拦截 |
+| 测试覆盖率未达目标（55-65%） | 中 | 低 | 优先覆盖关键路径和已修复 Bug，次要功能可后续补充 |
+| 修复引入新 Bug | 中 | 高 | 每个 Phase 完成后运行回归测试，及时发现问题 |
+
+---
+
+### 预估工作量
+
+| Phase | 开发时间 | 测试时间 | 总计 |
+|-------|---------|---------|------|
+| Phase 1 (P0) | 45-55 分钟 | 30 分钟 | 1.5 小时 |
+| Phase 2 (P1) | 60-65 分钟 | 25 分钟 | 1.5 小时 |
+| Phase 3 (P2) | 25 分钟 | 10 分钟 | 35 分钟 |
+| Phase 4 (系统级) | 20 分钟 | 10 分钟 | 30 分钟 |
+| Phase 5 (测试编写) | - | 140 分钟 | 2.5 小时 |
+| **总计** | **~3 小时** | **~3.5 小时** | **~6.5 小时** |
+
+**注**：实际时间可能因代码复杂度、测试环境准备等因素上下浮动 20-30%。
+
+---
+
+### Tech Lead 签名
+
+- **审核人**：Tech Lead Agent
+- **审核时间**：2026-02-06
+- **审核状态**：✅ 计划已审核通过，任务已分解完成
+- **下一步**：Developer Agent 执行 Phase 1-4，Tester Agent 执行 Phase 5
+
+---
+
 **Architect 任务完成。** 下一步：请用户输入 `/exit`，然后启动 Developer 和 Tester agents 执行修复和测试。
