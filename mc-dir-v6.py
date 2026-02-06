@@ -1932,6 +1932,11 @@ class Orchestrator:
         self.progress_file = self._init_progress_file()
         print(f"📝 进度文件: {self.progress_file.name}", flush=True)
 
+        # Bug Fix: 创建 feature 分支（从 plan 开始也需要分支隔离）
+        feature_branch = None
+        if not existing_state:  # 新任务才创建分支，恢复任务不创建
+            feature_branch = self._create_feature_branch("from-plan", "tech")
+
         # 所有可能的 agents（跳过 architect）
         all_agents = ["tech_lead", "developer", "tester", "optimizer", "security"]
 
@@ -2067,6 +2072,11 @@ class Orchestrator:
         # 初始化进度文件
         self.progress_file = self._init_progress_file()
         print(f"📝 进度文件: {self.progress_file.name}", flush=True)
+
+        # Bug Fix: 创建 feature 分支（从 plan 开始也需要分支隔离）
+        feature_branch = None
+        if not existing_state:  # 新任务才创建分支，恢复任务不创建
+            feature_branch = self._create_feature_branch("from-plan-loop", "tech")
 
         # 构建提示词（引用 PLAN.md 而非嵌入全文，避免 Windows 命令行长度限制）
         progress_info = ""
@@ -2215,6 +2225,16 @@ class Orchestrator:
             has_bugs, bug_summaries = self._check_bug_report()
 
             if not has_bugs:
+                # 保底检测：如果是第1轮且没有 BUG_REPORT.md，tester 可能没正确生成
+                bug_file = self.project_root / "BUG_REPORT.md"
+                if current_round == 1 and not bug_file.exists() and self.max_rounds > 1:
+                    print(f"\n⚠️ Round {current_round}: BUG_REPORT.md 不存在")
+                    print(f"   Tester 可能没有生成 bug 报告，将继续下一轮确认...")
+                    current_round += 1
+                    state["current_round"] = current_round
+                    self.state_manager.save_state(state)
+                    continue  # 继续下一轮循环
+
                 print(f"\n✅ Round {current_round}: 没有发现未解决的 bug，继续执行后续阶段")
                 break
 
@@ -2291,36 +2311,83 @@ class Orchestrator:
         bug_file = self.project_root / "BUG_REPORT.md"
 
         if not bug_file.exists():
+            print(f"   📋 BUG_REPORT.md 不存在，视为无 bug")
             return False, []
 
         try:
             content = bug_file.read_text(encoding='utf-8')
-        except (IOError, OSError):
+        except (IOError, OSError) as e:
+            print(f"   ⚠️ 无法读取 BUG_REPORT.md: {e}")
             return False, []
 
         if not content.strip():
+            print(f"   📋 BUG_REPORT.md 为空，视为无 bug")
             return False, []
 
-        # 解析 bug 列表
-        # 查找标记为未解决的 bug（常见格式：- [ ] bug描述 或 ❌ bug描述）
+        # 解析 bug 列表（支持多种格式）
         bug_summaries = []
         lines = content.split('\n')
 
+        # 关键词列表（用于检测未解决的问题）
+        bug_keywords = ['bug', 'fail', 'error', 'issue', 'problem', 'broken', 'fix', '错误', '失败', '问题']
+        resolved_keywords = ['fixed', 'resolved', 'done', 'completed', '已修复', '已解决', '完成']
+
         for line in lines:
             line_stripped = line.strip()
-            # 匹配未勾选的复选框
+            line_lower = line_stripped.lower()
+
+            # 跳过空行和已解决的标记
+            if not line_stripped:
+                continue
+            if any(kw in line_lower for kw in resolved_keywords):
+                continue
+            if line_stripped.startswith('- [x]') or line_stripped.startswith('* [x]'):
+                continue  # 已勾选的复选框，跳过
+
+            # 匹配未勾选的复选框（最高优先级）
             if line_stripped.startswith('- [ ]') or line_stripped.startswith('* [ ]'):
                 bug_text = line_stripped[5:].strip()
                 if bug_text:
-                    bug_summaries.append(bug_text[:100])  # 限制长度
+                    bug_summaries.append(bug_text[:100])
+                continue
+
             # 匹配带 ❌ 标记的行
-            elif '❌' in line_stripped and ('bug' in line_stripped.lower() or 'fail' in line_stripped.lower()):
+            if '❌' in line_stripped:
                 bug_summaries.append(line_stripped[:100])
+                continue
+
             # 匹配 "Status: FAILED" 或类似标记
-            elif 'status:' in line_stripped.lower() and 'fail' in line_stripped.lower():
+            if 'status:' in line_lower and 'fail' in line_lower:
                 bug_summaries.append(line_stripped[:100])
+                continue
+
+            # 匹配以 "## Bug" 或 "### Error" 等开头的标题
+            if line_stripped.startswith('#') and any(kw in line_lower for kw in ['bug', 'error', 'fail', 'issue']):
+                bug_summaries.append(line_stripped[:100])
+                continue
+
+            # 匹配包含 "Error:" 或 "Bug:" 前缀的行
+            if any(line_lower.startswith(prefix) for prefix in ['error:', 'bug:', 'issue:', 'problem:']):
+                bug_summaries.append(line_stripped[:100])
+                continue
+
+            # 匹配测试失败格式（如 "FAILED test_xxx" 或 "test_xxx FAILED"）
+            if 'failed' in line_lower and ('test' in line_lower or 'assert' in line_lower):
+                bug_summaries.append(line_stripped[:100])
+                continue
 
         has_bugs = len(bug_summaries) > 0
+
+        # 调试输出
+        if has_bugs:
+            print(f"   🐛 检测到 {len(bug_summaries)} 个未解决的 bug:")
+            for i, bug in enumerate(bug_summaries[:3], 1):
+                print(f"      {i}. {bug[:60]}{'...' if len(bug) > 60 else ''}")
+            if len(bug_summaries) > 3:
+                print(f"      ... 还有 {len(bug_summaries) - 3} 个")
+        else:
+            print(f"   ✅ BUG_REPORT.md 中没有检测到未解决的 bug")
+
         return has_bugs, bug_summaries
 
     def _archive_bug_report(self, round_num: int) -> None:
@@ -2405,11 +2472,34 @@ class Orchestrator:
         if self.progress_file:
             progress_suffix = f"\n\n📝 完成任务后，请更新进度文件: `{self.progress_file.name}`"
 
+        # 根据复杂度拆分执行阶段
+        # phases 格式示例（COMPLEX）: [["architect"], ["tech_lead"], ["developer"], ["tester", "security", "optimizer"]]
+        # phases 格式示例（MINIMAL）: [["developer"], ["tester"]]
+        pre_loop_agents = []  # Phase 1: 规划阶段（architect, tech_lead）
+        loop_agents = ["developer", "tester"]  # Phase 2: 开发-测试循环
+        post_loop_agents = []  # Phase 3: 优化阶段（optimizer, security）
+
+        # 从 phases 中提取各阶段的 agents
+        for phase in phases:
+            for agent in phase:
+                if agent in ["developer", "tester"]:
+                    # 这些 agent 在循环中执行，不放入 pre/post
+                    continue
+                elif agent in ["architect", "tech_lead"]:
+                    if agent not in pre_loop_agents:
+                        pre_loop_agents.append(agent)
+                elif agent in ["optimizer", "security"]:
+                    if agent not in post_loop_agents:
+                        post_loop_agents.append(agent)
+
         # Phase 1: 执行 architect 和 tech_lead（只执行一次）
-        phase1_agents = ["architect", "tech_lead"]
-        print(f"\n{'='*60}")
-        print(f"🔄 Phase 1: 规划和设计")
-        print(f"{'='*60}\n")
+        phase1_agents = pre_loop_agents
+        if phase1_agents:
+            print(f"\n{'='*60}")
+            print(f"🔄 Phase 1: 规划和设计")
+            print(f"{'='*60}\n")
+        else:
+            print(f"\n⏭️ 跳过 Phase 1（当前复杂度无需规划阶段）\n")
 
         for agent_name in phase1_agents:
             if state.get("agents_status", {}).get(agent_name) == "completed":
@@ -2543,6 +2633,16 @@ class Orchestrator:
             has_bugs, bug_summaries = self._check_bug_report()
 
             if not has_bugs:
+                # 保底检测：如果是第1轮且没有 BUG_REPORT.md，tester 可能没正确生成
+                bug_file = self.project_root / "BUG_REPORT.md"
+                if current_round == 1 and not bug_file.exists() and self.max_rounds > 1:
+                    print(f"\n⚠️ Round {current_round}: BUG_REPORT.md 不存在")
+                    print(f"   Tester 可能没有生成 bug 报告，将继续下一轮确认...")
+                    current_round += 1
+                    state["current_round"] = current_round
+                    self.state_manager.save_state(state)
+                    continue  # 继续下一轮循环
+
                 print(f"\n✅ Round {current_round}: 没有发现未解决的 bug，继续执行后续阶段")
                 break
 
