@@ -26,6 +26,12 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
+# Claude 账户配置目录
+CLAUDE_CONFIG_DIRS = {
+    'mc': os.path.expanduser('~/.claude-mc'),  # 账户1: mc
+    'xh': os.path.expanduser('~/.claude-xh')   # 账户2: xh
+}
+
 # Windows 控制台 UTF-8 编码支持
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -46,7 +52,8 @@ class AgentStatus(Enum):
 
 class TaskComplexity(Enum):
     """任务复杂度"""
-    SIMPLE = "simple"        # 仅3个agents (architect → developer → tester)
+    MINIMAL = "minimal"      # 2个agents (developer + tester)
+    SIMPLE = "simple"        # 3个agents (architect → developer → tester)
     MODERATE = "moderate"    # 4-5个agents
     COMPLEX = "complex"      # 完整6个agents
 
@@ -138,7 +145,7 @@ class TaskParser:
 
         return False
 
-    def generate_initial_prompt(self, user_request: str, agent_name: str = None) -> str:
+    def generate_initial_prompt(self, user_request: str, agent_name: str = None, progress_file: str = None) -> str:
         """生成初始任务提示词"""
         base_prompt = f"""用户需求：{user_request}
 
@@ -153,7 +160,32 @@ class TaskParser:
 
         # 如果是 architect 且是现有项目，添加代码库分析指令
         if agent_name == "architect" and self.is_existing_project():
-            base_prompt += """
+            # 优先检查是否有现成的代码库扫描结果（节省 token）
+            scan_file = self.project_root / "repo-scan-result.md"
+            if scan_file.exists():
+                try:
+                    scan_content = scan_file.read_text(encoding='utf-8')
+                    base_prompt += f"""
+
+⚠️ 重要提示：这是一个现有项目！
+
+✅ 已检测到代码库扫描结果文件 `repo-scan-result.md`，你可以直接使用以下分析结果，
+**无需重新扫描整个代码库**（节省 token）：
+
+---
+{scan_content[:3000]}
+---
+
+请基于以上分析结果，直接**使用 Write 工具**生成 `PLAN.md`（保存到项目根目录）。
+- 计划必须遵循现有的架构风格和代码规范
+- 复用现有模块，避免重复造轮子
+- 如果分析结果不够完整，你可以针对性地查看特定文件补充信息
+"""
+                except Exception:
+                    scan_file = None  # 读取失败，走原流程
+
+            if not scan_file or not scan_file.exists():
+                base_prompt += """
 
 ⚠️ 重要提示：这是一个现有项目！
 
@@ -175,6 +207,15 @@ class TaskParser:
    - 复用现有模块，避免重复造轮子
 
 记住：先理解代码，再做设计！
+"""
+
+        # 追加进度文件记录指令
+        if progress_file:
+            base_prompt += f"""
+
+📝 **进度记录**
+- 完成任务后，请使用 Write 工具更新进度文件: `{progress_file}`
+- 记录：任务描述、完成状态、关键输出摘要
 """
 
         return base_prompt
@@ -226,7 +267,12 @@ class AgentScheduler:
         根据复杂度规划执行阶段
         返回：[[Phase1 agents], [Phase2 agents], ...]
         """
-        if complexity == TaskComplexity.SIMPLE:
+        if complexity == TaskComplexity.MINIMAL:
+            return [
+                ["developer"],
+                ["tester"]
+            ]
+        elif complexity == TaskComplexity.SIMPLE:
             return [
                 ["architect"],
                 ["developer"],
@@ -286,9 +332,10 @@ class ManualTaskParser:
         "安全": "security",
     }
 
-    def __init__(self):
+    def __init__(self, project_root: Path = None):
         self.scheduler = AgentScheduler()
         self.valid_agents = self.scheduler.get_all_agent_names()
+        self.project_root = project_root or Path.cwd()
 
     def is_manual_mode(self, user_input: str) -> bool:
         """检测是否是手动指定模式（包含 @agent，支持中文别名）"""
@@ -346,7 +393,24 @@ class ManualTaskParser:
                         print(f"   可用的 agents: {', '.join(self.valid_agents)}")
                         return [], False
 
-                    phase_tasks.append((agent_name, task.strip()))
+                    task = task.strip()
+
+                    # 检测是否为 .md 文件引用
+                    if task.endswith('.md'):
+                        md_file = self.project_root / task
+                        if md_file.exists():
+                            try:
+                                task = md_file.read_text(encoding='utf-8')
+                                print(f"📄 @{agent_name}: 从 {md_file.name} 读取任务描述")
+                            except Exception as e:
+                                print(f"⚠️ 无法读取 {task}: {e}")
+                                return [], False
+                        else:
+                            print(f"❌ 文件不存在: {task}")
+                            print(f"   完整路径: {md_file}")
+                            return [], False
+
+                    phase_tasks.append((agent_name, task))
                 else:
                     print(f"❌ 无法解析任务: {task_str}")
                     print(f"   请使用格式: @agent_name 任务描述")
@@ -442,6 +506,74 @@ class AgentExecutor:
 
         return metadata, body
 
+    def _check_architect_violation(self, line: str) -> Optional[str]:
+        """
+        检查 stream-json 单行是否显示 architect 尝试写入非 .md 文件
+
+        检测逻辑：同一行 JSON 中同时出现 Write/Edit 工具名 + 非 .md 的 file_path
+        """
+        line = line.strip()
+        if not line:
+            return None
+
+        # 快速预检：必须同时包含 file_path 和 Write/Edit
+        if 'file_path' not in line:
+            return None
+        if 'Write' not in line and 'Edit' not in line:
+            return None
+
+        # 提取 file_path 值
+        match = re.search(r'"file_path"\s*:\s*"([^"]+)"', line)
+        if match:
+            file_path = match.group(1)
+            if not file_path.lower().endswith('.md'):
+                return f"🚫 Architect 越权！尝试修改非 .md 文件: {file_path}"
+
+        return None
+
+    async def _monitor_architect_stream(
+        self,
+        process: asyncio.subprocess.Process
+    ) -> Tuple[str, str, Optional[str]]:
+        """
+        实时监控 architect 的 stream-json 输出流
+
+        逐行读取 stdout，检测到 Write/Edit 非 .md 文件时立刻 kill 进程。
+        比事后校验更高效：节省时间和 token。
+
+        Returns:
+            (stdout_str, stderr_str, violation_msg)
+            violation_msg 为 None 表示正常完成
+        """
+        stdout_lines = []
+        violation = None
+
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break
+            line_str = line.decode('utf-8', errors='replace')
+            stdout_lines.append(line_str)
+
+            # 实时检测越权行为
+            violation = self._check_architect_violation(line_str)
+            if violation:
+                print(f"\n\n{violation}")
+                print(f"⏹️  立即终止 Architect 进程，节省后续 token 消耗")
+                process.kill()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
+                break
+
+        # 读取剩余 stderr
+        stderr_data = await process.stderr.read()
+        stderr_str = stderr_data.decode('utf-8', errors='replace')
+
+        stdout_str = ''.join(stdout_lines)
+        return stdout_str, stderr_str, violation
+
     async def run_agent(
         self,
         config: AgentConfig,
@@ -461,6 +593,27 @@ class AgentExecutor:
         if session_id is None:
             session_id = str(uuid.uuid4())
         start_time = time.time()
+
+        # 为 architect 追加权限限制（防止越权修改代码文件）
+        if config.name == "architect":
+            task_prompt += """
+
+---
+## ⚠️ 权限限制（必须严格遵守）
+
+你是 Architect Agent，**只能**写入以下类型的文件：
+- PLAN.md（实施计划）
+- CODEBASE_ANALYSIS.md（代码库分析）
+- 其他 .md 文档文件
+
+❌ **绝对禁止**：
+- 不得创建或修改任何源代码文件（.py, .js, .ts, .java, .go 等）
+- 不得修改配置文件（package.json, requirements.txt 等）
+- 不得运行测试或构建命令
+- 不得执行任何代码实现
+
+违反以上限制将导致你的输出被回滚。
+"""
 
         # 读取并解析 agent 角色配置（分离 YAML frontmatter）
         role_file = self.project_root / config.role_file
@@ -536,11 +689,21 @@ class AgentExecutor:
             progress_task = asyncio.create_task(progress_indicator(config.name, start_time))
 
             # 等待完成（带超时）
+            # architect 使用实时流监控，检测到写入非 .md 文件立刻终止
+            violation_msg = None
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=timeout
-                )
+                if config.name == "architect":
+                    stdout_str, stderr_str, violation_msg = await asyncio.wait_for(
+                        self._monitor_architect_stream(process),
+                        timeout=timeout
+                    )
+                    stdout = stdout_str.encode('utf-8')
+                    stderr = stderr_str.encode('utf-8')
+                else:
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(),
+                        timeout=timeout
+                    )
             except asyncio.TimeoutError:
                 progress_task.cancel()
                 print()  # 换行
@@ -568,6 +731,21 @@ class AgentExecutor:
                 except asyncio.CancelledError:
                     pass
                 print()  # 换行，结束进度行
+
+            # 如果 architect 被实时拦截，直接返回失败
+            if violation_msg:
+                cost, tokens = self._parse_stream_json(stdout.decode('utf-8', errors='replace'))
+                return ExecutionResult(
+                    agent_name=config.name,
+                    status=AgentStatus.FAILED,
+                    session_id=session_id,
+                    exit_code=-2,
+                    duration=time.time() - start_time,
+                    cost=cost,
+                    tokens=tokens,
+                    output_files=[],
+                    error_message=violation_msg
+                )
 
             # 解析stream-json输出获取成本和tokens
             cost, tokens = self._parse_stream_json(stdout.decode('utf-8', errors='replace'))
@@ -1050,6 +1228,50 @@ class Orchestrator:
         self.monitor = ProgressMonitor(verbose)
         self.interactive_architect = interactive_architect
         self.max_rounds = max_rounds
+        self.progress_file: Optional[Path] = None
+
+    def _init_progress_file(self) -> Path:
+        """
+        初始化 claude-progress 文件（避免与 agent 生成的 PROGRESS.md 冲突）
+        - 若 claude-progress.md 不存在 → 创建
+        - 若已存在 → 创建 claude-progress01.md, claude-progress02.md...
+        """
+        base = self.project_root / "claude-progress.md"
+        if not base.exists():
+            base.write_text("# 任务进度记录\n\n", encoding='utf-8')
+            return base
+
+        for i in range(1, 100):
+            numbered = self.project_root / f"claude-progress{i:02d}.md"
+            if not numbered.exists():
+                numbered.write_text("# 任务进度记录\n\n", encoding='utf-8')
+                return numbered
+
+        return base
+
+    def _cleanup_temp_agent_files(self) -> None:
+        """清理 agent 生成的临时 md 文件（保留 claude-progress 和 PLAN.md）"""
+        temp_files = [
+            "CODEBASE_ANALYSIS.md",
+            "BUG_REPORT.md",
+            "SECURITY_AUDIT.md",
+            "PROGRESS.md",
+        ]
+        for f in self.project_root.glob("BUG_REPORT_round*.md"):
+            try:
+                f.unlink()
+            except (OSError, PermissionError):
+                pass
+
+        for fname in temp_files:
+            f = self.project_root / fname
+            if f.exists():
+                try:
+                    f.unlink()
+                except (OSError, PermissionError):
+                    pass
+
+        print("🧹 已清理临时文件")
 
     def _cleanup_old_state(self) -> None:
         """清理旧的状态文件和错误日志"""
@@ -1193,13 +1415,206 @@ class Orchestrator:
             print(f"⚠️ Git 操作失败: {e}")
             return None
 
-    async def execute(self, user_request: str, clean_start: bool = True) -> bool:
+    def _get_current_branch(self) -> Optional[str]:
+        """获取当前 git 分支名"""
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                encoding='utf-8'
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+            return None
+        except Exception:
+            return None
+
+    def _create_agent_subbranch(self, parent_branch: str, agent_name: str) -> Optional[str]:
+        """
+        为特定 agent 创建隔离子分支
+
+        Returns:
+            子分支名（成功）或 None（失败）
+        """
+        try:
+            subbranch_name = f"{parent_branch}-{agent_name}-{str(uuid.uuid4())[:8]}"
+
+            result = subprocess.run(
+                ["git", "checkout", "-b", subbranch_name],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                encoding='utf-8'
+            )
+
+            if result.returncode == 0:
+                return subbranch_name
+            else:
+                print(f"⚠️ 创建子分支失败: {result.stderr}")
+                return None
+
+        except Exception as e:
+            print(f"⚠️ 创建子分支异常: {e}")
+            return None
+
+    def _switch_to_branch(self, branch_name: str) -> bool:
+        """切换到指定分支"""
+        try:
+            result = subprocess.run(
+                ["git", "checkout", branch_name],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                encoding='utf-8'
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _commit_agent_changes(self, agent_name: str, task_desc: str) -> bool:
+        """提交 agent 的所有更改"""
+        try:
+            subprocess.run(
+                ["git", "add", "-A"],
+                cwd=str(self.project_root),
+                capture_output=True
+            )
+
+            commit_msg = f"[{agent_name}] {task_desc[:50]}"
+            result = subprocess.run(
+                ["git", "commit", "-m", commit_msg, "--allow-empty"],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                encoding='utf-8'
+            )
+
+            return result.returncode == 0
+
+        except Exception:
+            return False
+
+    def _merge_subbranch(self, subbranch: str, target_branch: str) -> Tuple[bool, Optional[str]]:
+        """
+        将子分支合并到目标分支
+
+        Returns:
+            (成功, 冲突信息)
+        """
+        try:
+            if not self._switch_to_branch(target_branch):
+                return False, "无法切换到目标分支"
+
+            result = subprocess.run(
+                ["git", "merge", subbranch, "--no-edit"],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                encoding='utf-8'
+            )
+
+            if result.returncode == 0:
+                return True, None
+            else:
+                if "CONFLICT" in result.stdout or "conflict" in result.stderr.lower():
+                    subprocess.run(
+                        ["git", "merge", "--abort"],
+                        cwd=str(self.project_root),
+                        capture_output=True
+                    )
+                    return False, f"合并冲突: {result.stdout}"
+                return False, result.stderr
+
+        except Exception as e:
+            return False, str(e)
+
+    def _cleanup_subbranch(self, branch_name: str) -> None:
+        """删除子分支（合并成功后）"""
+        try:
+            subprocess.run(
+                ["git", "branch", "-d", branch_name],
+                cwd=str(self.project_root),
+                capture_output=True
+            )
+        except Exception:
+            pass
+
+    def _validate_architect_output(self) -> Tuple[bool, List[str]]:
+        """
+        校验 architect 执行后是否越权修改了非 .md 文件
+
+        Returns:
+            (is_clean, violated_files)
+        """
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--name-only"],
+                capture_output=True, text=True,
+                cwd=str(self.project_root), encoding='utf-8'
+            )
+            changed_files = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
+
+            # 也检查未跟踪的新文件
+            result2 = subprocess.run(
+                ["git", "ls-files", "--others", "--exclude-standard"],
+                capture_output=True, text=True,
+                cwd=str(self.project_root), encoding='utf-8'
+            )
+            new_files = [f.strip() for f in result2.stdout.strip().split('\n') if f.strip()]
+
+            all_files = changed_files + new_files
+            violated = [f for f in all_files if not f.lower().endswith('.md')]
+
+            return (len(violated) == 0, violated)
+        except Exception:
+            return (True, [])
+
+    def _rollback_architect_violations(self, violated_files: List[str]) -> None:
+        """回滚 architect 越权修改的文件"""
+        for f in violated_files:
+            file_path = self.project_root / f
+            try:
+                # 尝试还原已跟踪的文件
+                subprocess.run(
+                    ["git", "checkout", "--", f],
+                    capture_output=True,
+                    cwd=str(self.project_root)
+                )
+            except Exception:
+                pass
+
+            # 删除新创建的非 .md 文件（未跟踪的）
+            if file_path.exists():
+                try:
+                    check = subprocess.run(
+                        ["git", "ls-files", "--error-unmatch", f],
+                        capture_output=True,
+                        cwd=str(self.project_root)
+                    )
+                    if check.returncode != 0:
+                        file_path.unlink()
+                except Exception:
+                    pass
+
+        print(f"⚠️ Architect 越权修改了以下文件，已回滚:")
+        for f in violated_files:
+            print(f"   - {f}")
+
+    async def execute(
+        self,
+        user_request: str,
+        clean_start: bool = True,
+        override_complexity: Optional[TaskComplexity] = None
+    ) -> bool:
         """
         执行完整工作流
 
         Args:
             user_request: 用户需求描述
             clean_start: 是否清理旧状态（默认True，--resume时为False）
+            override_complexity: 手动指定复杂度（可选，优先于自动解析）
 
         Returns:
             True if successful, False if failed
@@ -1211,10 +1626,21 @@ class Orchestrator:
             self._cleanup_old_state()
             print("🧹 已清理旧的状态文件和错误日志\n", flush=True)
 
+        # 初始化进度文件
+        self.progress_file = self._init_progress_file()
+        print(f"📝 进度文件: {self.progress_file.name}", flush=True)
+
         # Phase 0.2: 解析任务
         print(f"📋 用户需求: {user_request}", flush=True)
-        task_prompt, complexity = self.task_parser.parse(user_request)
-        print(f"任务复杂度: {complexity.value}", flush=True)
+
+        # 使用覆盖的复杂度，或自动解析
+        if override_complexity:
+            complexity = override_complexity
+            task_prompt = user_request
+            print(f"任务复杂度: {complexity.value}（用户指定）", flush=True)
+        else:
+            task_prompt, complexity = self.task_parser.parse(user_request)
+            print(f"任务复杂度: {complexity.value}（自动解析）", flush=True)
 
         # Phase 0.5: 规划执行阶段
         phases = self.scheduler.plan_execution(complexity)
@@ -1285,8 +1711,9 @@ class Orchestrator:
 
             # 准备agent配置和提示词（只准备未完成的）
             configs = [self.scheduler.get_agent_config(name) for name in remaining_agents]
+            progress_name = self.progress_file.name if self.progress_file else None
             prompts = {
-                name: self.task_parser.generate_initial_prompt(user_request, agent_name=name)
+                name: self.task_parser.generate_initial_prompt(user_request, agent_name=name, progress_file=progress_name)
                 for name in remaining_agents
             }
 
@@ -1325,6 +1752,12 @@ class Orchestrator:
                 self.monitor.display_agent_complete(result)
                 all_results[config.name] = result
 
+                # Architect 后置校验：检查是否越权修改了非 .md 文件
+                if config.name == "architect" and result.status == AgentStatus.COMPLETED:
+                    is_clean, violated = self._validate_architect_output()
+                    if not is_clean:
+                        self._rollback_architect_violations(violated)
+
                 # 如果失败，终止执行
                 if result.status == AgentStatus.FAILED:
                     print(f"\n❌ {config.name} 执行失败，终止流程")
@@ -1332,20 +1765,43 @@ class Orchestrator:
                     return False
 
             else:
-                # 多个agents：并行执行（每个都带重试）
+                # 多个agents：并行执行 - 使用子分支隔离
                 # 为每个agent生成session_id
                 session_ids = {config.name: str(uuid.uuid4()) for config in configs}
+
+                # 记录主分支
+                main_branch = feature_branch if feature_branch else self._get_current_branch()
+                agent_subbranches = {}
 
                 for config in configs:
                     self.monitor.display_agent_start(config.name, session_ids[config.name])
 
-                # 并行执行所有agents（每个独立重试）
-                tasks = [
-                    self.error_handler.retry_with_backoff(
+                # 并行执行（每个 agent 在独立子分支）
+                async def run_agent_isolated(config: AgentConfig, prompt: str, session_id: str) -> ExecutionResult:
+                    # 创建子分支
+                    subbranch = self._create_agent_subbranch(main_branch, config.name)
+                    if subbranch:
+                        agent_subbranches[config.name] = subbranch
+
+                    # 执行 agent
+                    result = await self.error_handler.retry_with_backoff(
                         self.executor.run_agent,
                         config,
+                        prompt,
+                        session_id=session_id
+                    )
+
+                    # 提交更改
+                    if subbranch and result.status == AgentStatus.COMPLETED:
+                        self._commit_agent_changes(config.name, user_request[:50])
+
+                    return result
+
+                tasks = [
+                    run_agent_isolated(
+                        config,
                         prompts[config.name],
-                        session_id=session_ids[config.name]
+                        session_ids[config.name]
                     )
                     for config in configs
                 ]
@@ -1355,6 +1811,30 @@ class Orchestrator:
                 for result in results:
                     self.monitor.display_agent_complete(result)
                     all_results[result.agent_name] = result
+
+                # 合并子分支
+                if all(r.status == AgentStatus.COMPLETED for r in results) and agent_subbranches:
+                    print(f"\n🔀 合并各 agent 的更改...")
+                    merge_failures = []
+
+                    for agent_name, subbranch in agent_subbranches.items():
+                        success, conflict_info = self._merge_subbranch(subbranch, main_branch)
+                        if success:
+                            print(f"  ✅ {agent_name} 的更改已合并")
+                            self._cleanup_subbranch(subbranch)
+                        else:
+                            merge_failures.append((agent_name, conflict_info))
+                            print(f"  ❌ {agent_name} 合并失败: {conflict_info}")
+
+                    if merge_failures:
+                        print(f"\n⚠️ 检测到合并冲突！")
+                        print(f"   以下分支保留供手动处理:")
+                        for agent, _ in merge_failures:
+                            print(f"     - {agent_subbranches.get(agent, 'unknown')}")
+                elif agent_subbranches:
+                    # 有 agent 失败，清理子分支
+                    for subbranch in agent_subbranches.values():
+                        self._cleanup_subbranch(subbranch)
 
                 # 如果任何一个失败，终止执行
                 if any(r.status == AgentStatus.FAILED for r in results):
@@ -1397,6 +1877,11 @@ class Orchestrator:
             print(f"  5. 或创建 Pull Request 进行代码审查")
             print(f"{'='*60}\n")
 
+        # 提示进度文件位置 & 清理临时文件
+        if self.progress_file:
+            print(f"📝 本次进度记录: {self.progress_file.name}")
+        self._cleanup_temp_agent_files()
+
         return True
 
     def _save_final_state(
@@ -1427,6 +1912,10 @@ class Orchestrator:
         """
         start_time = time.time()
 
+        # 初始化进度文件
+        self.progress_file = self._init_progress_file()
+        print(f"📝 进度文件: {self.progress_file.name}", flush=True)
+
         # 所有可能的 agents（跳过 architect）
         all_agents = ["tech_lead", "developer", "tester", "optimizer", "security"]
 
@@ -1447,6 +1936,9 @@ class Orchestrator:
             return True
 
         # 构建提示词（包含 PLAN.md 内容）
+        progress_info = ""
+        if self.progress_file:
+            progress_info = f"\n📝 完成任务后，请更新进度文件: `{self.progress_file.name}`\n"
         task_prompt = f"""
 请根据以下实施计划执行你的职责：
 
@@ -1455,7 +1947,7 @@ class Orchestrator:
 ---
 
 请严格按照计划执行，确保与其他 agents 的工作保持一致。
-"""
+{progress_info}"""
 
         # 初始化或恢复状态
         if existing_state:
@@ -1534,6 +2026,11 @@ class Orchestrator:
         self._save_final_state(state, all_results, total_duration)
         self.monitor.display_summary(all_results, total_duration)
 
+        # 提示进度文件位置 & 清理临时文件
+        if self.progress_file:
+            print(f"📝 本次进度记录: {self.progress_file.name}")
+        self._cleanup_temp_agent_files()
+
         return True
 
     async def execute_from_plan_with_loop(
@@ -1556,7 +2053,14 @@ class Orchestrator:
         """
         start_time = time.time()
 
+        # 初始化进度文件
+        self.progress_file = self._init_progress_file()
+        print(f"📝 进度文件: {self.progress_file.name}", flush=True)
+
         # 构建提示词（包含 PLAN.md 内容）
+        progress_info = ""
+        if self.progress_file:
+            progress_info = f"\n📝 完成任务后，请更新进度文件: `{self.progress_file.name}`\n"
         task_prompt = f"""
 请根据以下实施计划执行你的职责：
 
@@ -1565,7 +2069,7 @@ class Orchestrator:
 ---
 
 请严格按照计划执行，确保与其他 agents 的工作保持一致。
-"""
+{progress_info}"""
 
         # 初始化或恢复状态
         if existing_state:
@@ -1764,6 +2268,11 @@ class Orchestrator:
 
         print(f"\n   执行了 {current_round} 轮 developer-tester 循环")
 
+        # 提示进度文件位置 & 清理临时文件
+        if self.progress_file:
+            print(f"📝 本次进度记录: {self.progress_file.name}")
+        self._cleanup_temp_agent_files()
+
         return True
 
     def _check_bug_report(self) -> Tuple[bool, List[str]]:
@@ -1824,7 +2333,8 @@ class Orchestrator:
         self,
         user_request: str,
         clean_start: bool = True,
-        existing_state: Optional[Dict] = None
+        existing_state: Optional[Dict] = None,
+        override_complexity: Optional[TaskComplexity] = None
     ) -> bool:
         """
         带多轮循环的执行模式
@@ -1837,6 +2347,7 @@ class Orchestrator:
             user_request: 用户请求
             clean_start: 是否清理旧状态
             existing_state: 现有状态（恢复时使用）
+            override_complexity: 手动指定复杂度（可选，优先于自动解析）
 
         Returns:
             True if successful, False if failed
@@ -1848,15 +2359,24 @@ class Orchestrator:
             self._cleanup_old_state()
             print("🧹 已清理旧的状态文件\n")
 
+        # 初始化进度文件
+        self.progress_file = self._init_progress_file()
+        print(f"📝 进度文件: {self.progress_file.name}", flush=True)
+
         # 解析任务复杂度
-        complexity = self.task_parser.parse_complexity(user_request)
-        print(f"📊 任务复杂度: {complexity.value}")
+        if override_complexity:
+            complexity = override_complexity
+            print(f"📊 任务复杂度: {complexity.value}（用户指定）")
+        else:
+            _, complexity = self.task_parser.parse(user_request)
+            print(f"📊 任务复杂度: {complexity.value}（自动解析）")
 
         # 获取执行计划
         phases = self.scheduler.plan_execution(complexity)
 
-        # 创建 feature 分支
-        feature_branch = self._create_feature_branch(user_request)
+        # 创建 feature 分支（获取首个agent名称）
+        first_agent = phases[0][0] if phases and phases[0] else "arch"
+        feature_branch = self._create_feature_branch(user_request, first_agent)
 
         # 初始化状态
         task_id = str(uuid.uuid4())
@@ -1873,6 +2393,11 @@ class Orchestrator:
         }
 
         all_results = {}
+
+        # 进度文件后缀（供各阶段 prompt 使用）
+        progress_suffix = ""
+        if self.progress_file:
+            progress_suffix = f"\n\n📝 完成任务后，请更新进度文件: `{self.progress_file.name}`"
 
         # Phase 1: 执行 architect 和 tech_lead（只执行一次）
         phase1_agents = ["architect", "tech_lead"]
@@ -1893,12 +2418,18 @@ class Orchestrator:
             result = await self.error_handler.retry_with_backoff(
                 self.executor.run_agent,
                 config,
-                user_request,
+                user_request + progress_suffix,
                 session_id=session_id
             )
 
             self.monitor.display_agent_complete(result)
             all_results[config.name] = result
+
+            # Architect 后置校验：检查是否越权修改了非 .md 文件
+            if config.name == "architect" and result.status == AgentStatus.COMPLETED:
+                is_clean, violated = self._validate_architect_output()
+                if not is_clean:
+                    self._rollback_architect_violations(violated)
 
             # 更新状态
             state["agents_status"][config.name] = result.status.value
@@ -1927,7 +2458,7 @@ class Orchestrator:
             print(f"{'='*60}\n")
 
             # 准备本轮的任务提示
-            round_prompt = user_request
+            round_prompt = user_request + progress_suffix
             if current_round > 1:
                 # 如果是第2轮+，附加上一轮的 bug 信息
                 has_bugs, bug_summaries = self._check_bug_report()
@@ -2041,7 +2572,7 @@ class Orchestrator:
             result = await self.error_handler.retry_with_backoff(
                 self.executor.run_agent,
                 config,
-                user_request,
+                user_request + progress_suffix,
                 session_id=session_id
             )
 
@@ -2071,6 +2602,11 @@ class Orchestrator:
             print(f"   执行了 {current_round} 轮 developer-tester 循环")
             print(f"{'='*60}\n")
 
+        # 提示进度文件位置 & 清理临时文件
+        if self.progress_file:
+            print(f"📝 本次进度记录: {self.progress_file.name}")
+        self._cleanup_temp_agent_files()
+
         return True
 
     async def execute_manual(
@@ -2094,6 +2630,10 @@ class Orchestrator:
         if clean_start:
             self._cleanup_old_state()
             print("🧹 已清理旧的状态文件\n")
+
+        # 初始化进度文件
+        self.progress_file = self._init_progress_file()
+        print(f"📝 进度文件: {self.progress_file.name}", flush=True)
 
         # 创建 feature 分支（使用首个 agent 名称）
         first_agent = phases[0][0][0] if phases and phases[0] else "arch"
@@ -2126,7 +2666,8 @@ class Orchestrator:
             for agent_name, task in phase_tasks:
                 config = self.scheduler.get_agent_config(agent_name)
                 configs.append(config)
-                prompts[agent_name] = self.task_parser.generate_initial_prompt(task, agent_name=agent_name)
+                progress_name = self.progress_file.name if self.progress_file else None
+                prompts[agent_name] = self.task_parser.generate_initial_prompt(task, agent_name=agent_name, progress_file=progress_name)
 
             # 串行 or 并行执行
             if len(phase_tasks) == 1:
@@ -2158,32 +2699,91 @@ class Orchestrator:
                 self.monitor.display_agent_complete(result)
                 all_results[agent_name] = result
 
+                # Architect 后置校验：检查是否越权修改了非 .md 文件
+                if agent_name == "architect" and result.status == AgentStatus.COMPLETED:
+                    is_clean, violated = self._validate_architect_output()
+                    if not is_clean:
+                        self._rollback_architect_violations(violated)
+
                 if result.status == AgentStatus.FAILED:
                     print(f"\n❌ {agent_name} 执行失败，终止流程")
                     self._save_final_state(state, all_results, time.time() - start_time)
                     return False
 
             else:
-                # 多个 agent 并行执行
+                # 多个 agent 并行执行 - 使用子分支隔离
                 session_ids = {config.name: str(uuid.uuid4()) for config in configs}
+
+                # 记录主分支
+                main_branch = feature_branch if feature_branch else self._get_current_branch()
+                agent_subbranches = {}
 
                 for config in configs:
                     self.monitor.display_agent_start(config.name, session_ids[config.name])
 
-                tasks = [
-                    self.error_handler.retry_with_backoff(
+                # 并行执行（每个 agent 在独立子分支）
+                async def run_agent_isolated(config: AgentConfig, prompt: str, session_id: str, task_desc: str) -> ExecutionResult:
+                    # 创建子分支
+                    subbranch = self._create_agent_subbranch(main_branch, config.name)
+                    if subbranch:
+                        agent_subbranches[config.name] = subbranch
+
+                    # 执行 agent
+                    result = await self.error_handler.retry_with_backoff(
                         self.executor.run_agent,
                         config,
+                        prompt,
+                        session_id=session_id
+                    )
+
+                    # 提交更改
+                    if subbranch and result.status == AgentStatus.COMPLETED:
+                        self._commit_agent_changes(config.name, task_desc)
+
+                    return result
+
+                # 获取每个 agent 对应的任务描述
+                agent_task_map = {agent: task for agent, task in phase_tasks}
+
+                tasks = [
+                    run_agent_isolated(
+                        config,
                         prompts[config.name],
-                        session_id=session_ids[config.name]
+                        session_ids[config.name],
+                        agent_task_map.get(config.name, "parallel-task")
                     )
                     for config in configs
                 ]
                 results = await asyncio.gather(*tasks)
 
+                # 显示结果
                 for result in results:
                     self.monitor.display_agent_complete(result)
                     all_results[result.agent_name] = result
+
+                # 合并子分支
+                if all(r.status == AgentStatus.COMPLETED for r in results) and agent_subbranches:
+                    print(f"\n🔀 合并各 agent 的更改...")
+                    merge_failures = []
+
+                    for agent_name, subbranch in agent_subbranches.items():
+                        success, conflict_info = self._merge_subbranch(subbranch, main_branch)
+                        if success:
+                            print(f"  ✅ {agent_name} 的更改已合并")
+                            self._cleanup_subbranch(subbranch)
+                        else:
+                            merge_failures.append((agent_name, conflict_info))
+                            print(f"  ❌ {agent_name} 合并失败: {conflict_info}")
+
+                    if merge_failures:
+                        print(f"\n⚠️ 检测到合并冲突！")
+                        print(f"   以下分支保留供手动处理:")
+                        for agent, _ in merge_failures:
+                            print(f"     - {agent_subbranches.get(agent, 'unknown')}")
+                elif agent_subbranches:
+                    # 有 agent 失败，清理子分支
+                    for subbranch in agent_subbranches.values():
+                        self._cleanup_subbranch(subbranch)
 
                 if any(r.status == AgentStatus.FAILED for r in results):
                     failed = [r.agent_name for r in results if r.status == AgentStatus.FAILED]
@@ -2213,12 +2813,49 @@ class Orchestrator:
             print(f"下一步：git add . && git commit -m \"完成手动任务\"")
             print(f"{'='*60}\n")
 
+        # 提示进度文件位置 & 清理临时文件
+        if self.progress_file:
+            print(f"📝 本次进度记录: {self.progress_file.name}")
+        self._cleanup_temp_agent_files()
+
         return True
 
 
 # ============================================================
 # CLI接口
 # ============================================================
+
+def _open_file_in_editor(file_path: Path) -> None:
+    """
+    在用户默认编辑器中打开文件并等待关闭
+
+    跨平台支持:
+    - Windows: 使用 start /wait，回退到 notepad
+    - Linux/Mac: 使用 $EDITOR，回退到 nano/vi
+    """
+    import shutil
+
+    file_str = str(file_path)
+
+    if sys.platform == 'win32':
+        try:
+            subprocess.run(['cmd', '/c', 'start', '/wait', '', file_str], check=True)
+        except subprocess.CalledProcessError:
+            subprocess.run(['notepad', file_str])
+    else:
+        editor = os.environ.get('EDITOR', '')
+        if not editor:
+            for ed in ['code', 'nano', 'vim', 'vi']:
+                if shutil.which(ed):
+                    editor = ed
+                    break
+
+        if editor:
+            subprocess.run([editor, file_str])
+        else:
+            print(f"⚠️ 无法找到文本编辑器。请手动编辑: {file_path}")
+            input("编辑完成后按回车继续...")
+
 
 def semi_auto_mode(project_root: Path, config: dict):
     """
@@ -2341,9 +2978,46 @@ def semi_auto_mode(project_root: Path, config: dict):
         print(f"   文件路径: {plan_file}")
         print(f"   请检查文件是否存在且可读\n")
 
+    # === 阶段1: 提供计划审核/编辑选项 ===
+    print(f"\n{'='*60}")
+    print(f"📝 计划审核")
+    print(f"{'='*60}")
+    print(f"选项：")
+    print(f"  Y/y/是  - 打开编辑器查看/修改 PLAN.md")
+    print(f"  n/否    - 跳过编辑，直接进入执行确认")
+    print(f"  q/退出  - 取消执行，稍后使用模式2继续")
+
+    review_choice = input("\n是否查看/编辑 PLAN.md？[Y/n/q] ").strip().lower()
+
+    if review_choice in ['q', '退出', 'quit']:
+        print("\n已取消。你可以：")
+        print(f"  1. 手动编辑 PLAN.md: {plan_file}")
+        print(f"  2. 使用模式 2（从 PLAN.md 继续）重新运行")
+        return False
+
+    if review_choice not in ['n', 'no', '否']:
+        # 打开编辑器让用户查看/编辑
+        _open_file_in_editor(plan_file)
+        print(f"\n✅ 编辑器已关闭。")
+
+        # 重新读取 PLAN.md 显示更新后的预览
+        try:
+            with open(plan_file, 'r', encoding='utf-8', errors='replace') as f:
+                preview = f.read(500)
+            print(f"\n--- 更新后的 PLAN.md 预览 ---")
+            print(preview)
+            if len(preview) >= 500:
+                print("... (更多内容请查看文件)")
+            print(f"--- 预览结束 ---\n")
+        except (IOError, OSError, UnicodeDecodeError) as e:
+            print(f"\n⚠️ 重新读取 PLAN.md 失败: {e}")
+
+    # === 阶段2: 最终执行确认 ===
     confirm = input("确认执行后续 Agents？[Y/n] ").strip().lower()
     if confirm in ['n', 'no', '否']:
-        print("已取消。你可以修改 PLAN.md 后重新运行。")
+        print("\n已取消。你可以：")
+        print(f"  1. 继续修改 PLAN.md: {plan_file}")
+        print(f"  2. 使用模式 2（从 PLAN.md 继续）重新运行")
         return False
 
     # 读取 PLAN.md 作为任务描述（带容错）
@@ -2471,6 +3145,21 @@ def _ask_max_rounds() -> int:
         return 1
 
 
+def _ask_task_complexity() -> TaskComplexity:
+    """询问用户选择任务复杂度"""
+    print("""
+任务复杂度：
+  1. 简单任务 - 只用 developer + tester（2个agents，快速执行）
+  2. 复杂任务 - 完整流程（6个agents，全面保障）
+""")
+    complexity_choice = input("请选择 [1/2，直接回车=2]: ").strip()
+
+    if complexity_choice == '1':
+        return TaskComplexity.MINIMAL
+    else:
+        return TaskComplexity.COMPLEX
+
+
 def interactive_mode(project_root: Path):
     """交互式 CLI 模式 - 默认进入半自动模式"""
     print("""
@@ -2482,7 +3171,7 @@ def interactive_mode(project_root: Path):
   1. 半自动模式（推荐）- 进入 Claude CLI 讨论需求，生成 PLAN.md 后自动执行
   2. 从 PLAN.md 继续 - 跳过 Architect，直接从现有计划执行（节省 token）
   3. 全自动模式 - 输入任务后，Architect 自动规划并执行全流程
-  4. 传统交互模式 - 在此输入需求，可手动指定 agents
+  4. （ADV）多agent模式* - 可同时指派多名 Agents🚀🚀🚀
   5. 退出
 """)
 
@@ -2501,14 +3190,23 @@ def interactive_mode(project_root: Path):
         print("\n👋 再见！")
         return
 
-    # 模式 1/2/3 都需要询问迭代轮数
+    # 模式 1/2/3 都需要询问迭代轮数和任务复杂度
     if choice in ['1', '2', '3', '']:
+        # 询问迭代轮数
         config['max_rounds'] = _ask_max_rounds()
         if config['max_rounds'] > 1:
             print(f"✓ 已设置: 最多 {config['max_rounds']} 轮 developer-tester 迭代\n")
 
+        # 询问任务复杂度
+        config['complexity'] = _ask_task_complexity()
+        complexity_label = "简单任务（2个agents）" if config['complexity'] == TaskComplexity.MINIMAL else "复杂任务（6个agents）"
+        print(f"✓ 已设置: {complexity_label}\n")
+
     if choice == '1' or choice == '':
         # 半自动模式
+        # 注意：半自动模式会进入 Claude CLI 生成 PLAN.md，复杂度设置会被忽略
+        if config.get('complexity') == TaskComplexity.MINIMAL:
+            print("⚠️ 注意：半自动模式会由 Architect 自动规划，复杂度设置将被忽略\n")
         success = semi_auto_mode(project_root, config)
         if success:
             print("\n✅ 所有 Agents 执行完成！")
@@ -2516,6 +3214,9 @@ def interactive_mode(project_root: Path):
 
     if choice == '2':
         # 从 PLAN.md 继续执行
+        # 注意：PLAN.md 已存在，复杂度设置会被忽略
+        if config.get('complexity') == TaskComplexity.MINIMAL:
+            print("⚠️ 注意：从 PLAN.md 继续模式会按计划执行，复杂度设置将被忽略\n")
         success = from_plan_mode(project_root, config)
         if success:
             print("\n✅ 所有 Agents 执行完成！")
@@ -2550,9 +3251,15 @@ def interactive_mode(project_root: Path):
 
         print(f"\n🚀 全自动模式启动...")
         if config['max_rounds'] > 1:
-            success = asyncio.run(orchestrator.execute_with_loop(task_input))
+            success = asyncio.run(orchestrator.execute_with_loop(
+                task_input,
+                override_complexity=config.get('complexity')
+            ))
         else:
-            success = asyncio.run(orchestrator.execute(task_input))
+            success = asyncio.run(orchestrator.execute(
+                task_input,
+                override_complexity=config.get('complexity')
+            ))
 
         if success:
             print("\n✅ 所有 Agents 执行完成！")
@@ -2586,6 +3293,8 @@ def interactive_mode(project_root: Path):
 
 【手动指定模式】使用 @agent 语法：
   @tech_lead 审核代码                    # 单个 agent
+  @dev task1.md                          # 从 md 文件读取任务
+  @dev task1.md && @opti task2.md        # 多 agent + md 文件
   @tech_lead 审核 && @security 安检      # 并行执行
   @tech_lead 审核 -> @developer 修复     # 串行执行
   @tech 审核 -> (@dev 修复 && @sec 安检) # 混合模式
@@ -2716,7 +3425,7 @@ def interactive_mode(project_root: Path):
                 continue
 
             # 检测是否是手动指定模式
-            manual_parser = ManualTaskParser()
+            manual_parser = ManualTaskParser(project_root)
 
             if manual_parser.is_manual_mode(user_input):
                 # ========== 手动指定模式 ==========
@@ -2807,8 +3516,52 @@ def interactive_mode(project_root: Path):
             continue
 
 
+def _select_account() -> str:
+    """
+    选择 Claude 账户
+
+    Returns:
+        选中的账户标识 ('mc' 或 'xh')
+    """
+    print("""
+╔════════════════════════════════════════════════════════════╗
+║       🔐 Claude 账户选择                                    ║
+╚════════════════════════════════════════════════════════════╝
+
+可用账户：
+  mc - Claude Pro 账户 (mc)
+  xh - Claude Pro 账户 (xh)
+""")
+
+    while True:
+        choice = input("请选择账户 [mc/xh，直接回车=mc]: ").strip().lower()
+
+        if not choice:
+            choice = 'mc'
+
+        if choice in CLAUDE_CONFIG_DIRS:
+            config_dir = CLAUDE_CONFIG_DIRS[choice]
+
+            # 检查配置目录是否存在
+            if not os.path.exists(config_dir):
+                print(f"⚠️ 警告: 配置目录不存在: {config_dir}")
+                print(f"   请先运行 'claude-{choice}' 初始化配置\n")
+                continue
+
+            # 设置环境变量
+            os.environ['CLAUDE_CONFIG_DIR'] = config_dir
+            print(f"✓ 已选择账户: {choice}")
+            print(f"✓ 配置目录: {config_dir}\n")
+            return choice
+        else:
+            print(f"❌ 无效选择: {choice}，请输入 'mc' 或 'xh'\n")
+
+
 def main():
     """CLI入口"""
+    # 步骤0: 选择 Claude 账户
+    selected_account = _select_account()
+
     parser = argparse.ArgumentParser(
         description="mc-dir - 多Agent智能调度系统",
         formatter_class=argparse.RawDescriptionHelpFormatter,
