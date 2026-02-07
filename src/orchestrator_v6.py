@@ -682,9 +682,10 @@ class AgentExecutor:
         # 使用 semaphore 限制并发数（异步执行子进程）
         async with self._semaphore:
           try:
-            # 设置环境变量，用于 git hook 检测
+            # 设置环境变量，用于 hook 检测
             env = os.environ.copy()
             env['ORCHESTRATOR_RUNNING'] = 'true'
+            env['ORCHESTRATOR_AGENT'] = config.name  # Hook 用此变量识别当前 agent
 
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -2963,6 +2964,69 @@ def _open_file_in_editor(file_path: Path) -> None:
             input("编辑完成后按回车继续...")
 
 
+def _validate_architect_changes(project_root: Path):
+    """
+    后置校验：检查 architect 是否越权修改了非 .md 文件
+    如果发现违规，回滚非 .md 文件的改动
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only"],
+            cwd=str(project_root),
+            capture_output=True, text=True, timeout=10
+        )
+        changed_files = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
+
+        # 也检查未跟踪的新文件
+        result2 = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=str(project_root),
+            capture_output=True, text=True, timeout=10
+        )
+        new_files = [f.strip() for f in result2.stdout.strip().split('\n') if f.strip()]
+
+        # 找出被修改的非 .md 文件
+        violated_changed = [f for f in changed_files if not f.lower().endswith('.md')]
+        violated_new = [f for f in new_files if not f.lower().endswith('.md')
+                        and not f.startswith('.claude/')]
+
+        if violated_changed or violated_new:
+            print(f"\n{'='*60}")
+            print(f"⚠️  ARCHITECT 后置校验：检测到越权修改！")
+            print(f"{'='*60}")
+
+            if violated_changed:
+                print(f"\n   被修改的非 .md 文件:")
+                for f in violated_changed:
+                    print(f"     ❌ {f}")
+                # 回滚修改的文件
+                subprocess.run(
+                    ["git", "checkout", "--"] + violated_changed,
+                    cwd=str(project_root), timeout=10
+                )
+                print(f"\n   ✅ 已回滚 {len(violated_changed)} 个被修改的文件")
+
+            if violated_new:
+                print(f"\n   新建的非 .md 文件:")
+                for f in violated_new:
+                    print(f"     ❌ {f}")
+                # 删除新建的非 .md 文件
+                for f in violated_new:
+                    file_path = project_root / f
+                    if file_path.exists():
+                        file_path.unlink()
+                print(f"\n   ✅ 已删除 {len(violated_new)} 个越权创建的文件")
+
+            print(f"\n{'='*60}\n")
+        else:
+            print(f"\n✅ Architect 后置校验通过：未检测到越权修改")
+
+    except Exception as e:
+        print(f"\n⚠️ Architect 后置校验异常: {e}")
+
+
 def semi_auto_mode(project_root: Path, config: dict):
     """
     情景2：半自动执行模式
@@ -3053,9 +3117,23 @@ def semi_auto_mode(project_root: Path, config: dict):
 
     env = os.environ.copy()
     env['ORCHESTRATOR_RUNNING'] = 'true'
+    env['ORCHESTRATOR_AGENT'] = 'architect'  # Hook 用此变量检测 architect 阶段
 
-    # 执行 claude（阻塞，用户交互）
-    process = subprocess.run(cmd, cwd=str(project_root), env=env)
+    # 创建锁文件（Hook 备用检测方式）
+    lock_file = project_root / ".claude" / "architect_active.lock"
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_file.write_text("architect session active", encoding='utf-8')
+
+    try:
+        # 执行 claude（阻塞，用户交互）
+        process = subprocess.run(cmd, cwd=str(project_root), env=env)
+    finally:
+        # 清理锁文件
+        if lock_file.exists():
+            lock_file.unlink()
+
+    # 后置校验：检查 architect 是否越权修改了非 .md 文件
+    _validate_architect_changes(project_root)
 
     # 检查 PLAN.md 是否生成
     plan_file = project_root / "PLAN.md"
