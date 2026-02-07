@@ -11,9 +11,10 @@ tools: Read, Glob, Grep, Bash, Task
 - 📋 **`.claude/memory/ARCHITECT_RULES.md`** - 本项目的 Architect 专属规则，记录了反复出现的错误和经验教训
 
 **关键规则摘要**：
-1. ✅ **所有计划必须保存到项目根目录 `plan.md`**（不是 `~/.claude-mc/plans/`）
-2. ✅ 如果 `plan.md` 已存在，使用 **Edit 工具追加**内容（不要 Write 创建新文件）
-3. ✅ 使用**相对于 repo 根目录的路径**（如 `plan.md`，不是绝对路径）
+1. ✅ **所有计划必须保存到项目根目录 `PLAN.md`**（不是 `~/.claude-mc/plans/`）
+2. ✅ 如果 `PLAN.md` 已存在，使用 **Edit 工具更新**内容（不要用 Write 覆盖）
+3. ✅ 如果 `PLAN.md` 不存在，使用 **Write 工具创建**
+4. ✅ 使用**相对路径**（如 `PLAN.md`，不是绝对路径）
 4. ✅ 任务结束前，必须生成 `claude-progress.md`
 
 详细规则请查看 `.claude/memory/ARCHITECT_RULES.md`。
@@ -219,16 +220,17 @@ except:
 ### 文件保存位置
 
 ```python
-# 保存到项目根目录（相对路径）
+# 保存到项目根目录（固定文件名，先 Read 保留已有内容再 Write 追加）
+Read(file_path="claude-progress.md")
 Write(
-    file_path="claude-progress.md",  # 或 claude-progress01.md（如果前一个未删除）
-    content="..."
+    file_path="claude-progress.md",
+    content="已有内容 + 你的新内容"
 )
 ```
 
 ### 检查清单（任务结束前必查）
 
-- [ ] 是否已生成 `plan.md`？
+- [ ] 是否已生成 `PLAN.md`？
 - [ ] 是否已生成 `claude-progress.md`？
 - [ ] progress.md 是否包含"🐛 错误记录"章节？
 - [ ] 是否已告知用户"交给其他 agents 执行"？
@@ -390,7 +392,7 @@ Write(
 
 ### ✅ 应该做的事：
 1. **告知用户**："✅ 计划已完成！请交给 Developer agent 执行修复计划。"
-2. **如果需要**：可以继续编辑 `plan.md` 文件（追加、修正内容）
+2. **如果需要**：可以继续编辑 `PLAN.md` 文件（追加、修正内容）
 3. **任务结束**：明确告知用户你的工作到此结束
 
 ### ❌ 绝对不能做的事：
@@ -402,7 +404,7 @@ Write(
 ## 系统提示解读
 
 当你看到 **"You can now make edits"** 时：
-- ✅ 正确理解：可以编辑 **plan.md** 文件（如果需要追加内容）
+- ✅ 正确理解：可以编辑 **PLAN.md** 文件（如果需要追加内容）
 - ❌ 错误理解：~~可以修改源代码~~
 
 ## 职责边界（重要！）
@@ -461,7 +463,7 @@ Edit(file_path="src/6-agents.py", ...)  # 修改源代码
 - 已完成代码库分析
 - 已识别 Bug #7 的根因（Path.cwd() 路径问题）
 - 已设计完整的修复方案（添加 find_project_root() 函数）
-- 修复方案已记录到 plan.md
+- 修复方案已记录到 PLAN.md
 
 **下一步行动**：
 请用户输入 /exit 退出当前会话，然后：
@@ -473,7 +475,7 @@ Edit(file_path="src/6-agents.py", ...)  # 修改源代码
 
 ## 检查清单（每次 ExitPlanMode 前）
 
-- [ ] 是否已生成 `plan.md` 或更新了现有的 plan？
+- [ ] 是否已生成 `PLAN.md` 或更新了现有的 plan？
 - [ ] 是否已生成 `claude-progress.md` 记录工作过程？
 - [ ] 是否已明确告知用户"交给其他 agents 执行"？
 - [ ] 是否**没有**尝试执行代码修复？

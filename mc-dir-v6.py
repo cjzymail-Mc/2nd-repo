@@ -136,11 +136,12 @@ class TaskParser:
                 cwd=str(self.project_root),
                 capture_output=True,
                 text=True,
-                encoding='utf-8'
+                encoding='utf-8',
+                timeout=30
             )
             if result.returncode == 0 and result.stdout.strip():
                 return True
-        except:
+        except Exception:
             pass
 
         return False
@@ -176,7 +177,8 @@ class TaskParser:
 {scan_content[:3000]}
 ---
 
-请基于以上分析结果，直接**使用 Write 工具**生成 `PLAN.md`（保存到项目根目录）。
+请基于以上分析结果，生成 `PLAN.md`（保存到项目根目录）：
+- 先用 Read 检查 `PLAN.md` 是否已存在：已存在则用 Edit 更新，不存在则用 Write 创建
 - 计划必须遵循现有的架构风格和代码规范
 - 复用现有模块，避免重复造轮子
 - 如果分析结果不够完整，你可以针对性地查看特定文件补充信息
@@ -202,7 +204,7 @@ class TaskParser:
      * 模块依赖关系
 
 2. **第二步：制定计划**
-   - 基于代码库分析，**使用 Write 工具**生成 `PLAN.md`（保存到项目根目录）
+   - 先用 Read 检查 `PLAN.md` 是否已存在：已存在则用 Edit 更新，不存在则用 Write 创建
    - 计划必须遵循现有的架构风格和代码规范
    - 复用现有模块，避免重复造轮子
 
@@ -214,8 +216,9 @@ class TaskParser:
             base_prompt += f"""
 
 📝 **进度记录**
-- 完成任务后，请使用 Write 工具更新进度文件: `{progress_file}`
-- 记录：任务描述、完成状态、关键输出摘要
+- 完成任务后，请将你的工作记录**追加**到进度文件: `{progress_file}`
+- 先用 Read 读取现有内容，再用 Write 写入（保留已有内容 + 追加你的部分）
+- 记录：你的角色名、任务描述、完成状态、关键输出摘要
 """
 
         return base_prompt
@@ -547,6 +550,7 @@ class AgentExecutor:
         """
         stdout_lines = []
         violation = None
+        MAX_LINES = 5000  # 防止 OOM
 
         while True:
             line = await process.stdout.readline()
@@ -554,6 +558,8 @@ class AgentExecutor:
                 break
             line_str = line.decode('utf-8', errors='replace')
             stdout_lines.append(line_str)
+            if len(stdout_lines) > MAX_LINES:
+                stdout_lines = stdout_lines[-MAX_LINES:]
 
             # 实时检测越权行为
             violation = self._check_architect_violation(line_str)
@@ -661,12 +667,8 @@ class AgentExecutor:
             "--no-chrome",
         ]
 
-        # architect 使用 plan 模式限制权限，防止直接修改代码
-        # 其他 agents 使用 skip-permissions 允许实际执行
-        if config.name == "architect":
-            cmd.extend(["--permission-mode", "plan"])
-        else:
-            cmd.append("--dangerously-skip-permissions")
+        # 所有 agent 使用 skip-permissions（architect 由 hook + stream monitor 防护）
+        cmd.append("--dangerously-skip-permissions")
 
         # 进度指示器
         async def progress_indicator(agent_name: str, start: float):
@@ -682,9 +684,10 @@ class AgentExecutor:
         # 使用 semaphore 限制并发数（异步执行子进程）
         async with self._semaphore:
           try:
-            # 设置环境变量，用于 git hook 检测
+            # 设置环境变量，用于 hook 检测
             env = os.environ.copy()
             env['ORCHESTRATOR_RUNNING'] = 'true'
+            env['ORCHESTRATOR_AGENT'] = config.name  # Hook 用此变量识别当前 agent
 
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -844,11 +847,11 @@ class AgentExecutor:
 
 ## 输出要求
 
-请将计划文件保存到项目根目录：
-- `PLAN.md` - 实施计划（必须生成）
+请将计划文件保存到项目根目录（使用相对路径）：
+- `PLAN.md` - 实施计划（必须生成）：先检查是否已存在，已存在则用 Edit 更新，不存在则用 Write 创建
 - `CODEBASE_ANALYSIS.md` - 代码库分析（如果是现有项目）
 
-完成后请告知用户已生成上述文件。
+完成后请告知用户已生成上述文件，并输入 /exit 退出。
 """
         full_prompt = f"{role_prompt}\n\n---\n\n{task_prompt}{output_instruction}"
 
@@ -866,16 +869,17 @@ class AgentExecutor:
         cmd = [
             "claude",
             "--model", agent_model,
-            "--permission-mode", "plan",  # 自动进入 plan 模式
+            "--dangerously-skip-permissions",  # hooks 提供 architect 权限管控
             "--append-system-prompt", role_prompt,  # 角色定义作为系统提示
             task_prompt + output_instruction,  # 用户任务作为初始 prompt
         ]
 
         # 同步执行（阻塞等待用户交互）
         try:
-            # 设置环境变量，用于 git hook 检测
+            # 设置环境变量，用于 hook 检测
             env = os.environ.copy()
             env['ORCHESTRATOR_RUNNING'] = 'true'
+            env['ORCHESTRATOR_AGENT'] = config.name  # Hook 用此变量识别当前 agent
 
             # 使用 subprocess.run，不重定向 stdin/stdout/stderr，让用户直接交互
             process = subprocess.run(
@@ -1248,21 +1252,19 @@ class Orchestrator:
 
     def _init_progress_file(self) -> Path:
         """
-        初始化 claude-progress 文件（避免与 agent 生成的 PROGRESS.md 冲突）
-        - 若 claude-progress.md 不存在 → 创建
-        - 若已存在 → 创建 claude-progress01.md, claude-progress02.md...
+        初始化 claude-progress.md（固定文件名，每次运行重新创建）
+        - 删除旧的 claude-progress.md 和历史编号文件
+        - 创建全新的 claude-progress.md
         """
         base = self.project_root / "claude-progress.md"
-        if not base.exists():
-            base.write_text("# 任务进度记录\n\n", encoding='utf-8')
-            return base
 
-        for i in range(1, 100):
-            numbered = self.project_root / f"claude-progress{i:02d}.md"
-            if not numbered.exists():
-                numbered.write_text("# 任务进度记录\n\n", encoding='utf-8')
-                return numbered
+        # 清理旧文件：固定名称 + 历史编号文件（claude-progress01.md 等）
+        if base.exists():
+            base.unlink()
+        for old in self.project_root.glob("claude-progress[0-9][0-9].md"):
+            old.unlink()
 
+        base.write_text("# 任务进度记录\n\n", encoding='utf-8')
         return base
 
     def _cleanup_temp_agent_files(self) -> None:
@@ -1387,7 +1389,8 @@ class Orchestrator:
                 cwd=str(self.project_root),
                 capture_output=True,
                 text=True,
-                encoding='utf-8'
+                encoding='utf-8',
+                timeout=30
             )
             if result.returncode != 0:
                 return None  # 不是 git 仓库，跳过分支创建
@@ -1439,7 +1442,8 @@ class Orchestrator:
                 cwd=str(self.project_root),
                 capture_output=True,
                 text=True,
-                encoding='utf-8'
+                encoding='utf-8',
+                timeout=30
             )
             if result.returncode == 0:
                 return result.stdout.strip()
@@ -1462,7 +1466,8 @@ class Orchestrator:
                 cwd=str(self.project_root),
                 capture_output=True,
                 text=True,
-                encoding='utf-8'
+                encoding='utf-8',
+                timeout=30
             )
 
             if result.returncode == 0:
@@ -1483,7 +1488,8 @@ class Orchestrator:
                 cwd=str(self.project_root),
                 capture_output=True,
                 text=True,
-                encoding='utf-8'
+                encoding='utf-8',
+                timeout=30
             )
             return result.returncode == 0
         except Exception:
@@ -1495,7 +1501,8 @@ class Orchestrator:
             subprocess.run(
                 ["git", "add", "-A"],
                 cwd=str(self.project_root),
-                capture_output=True
+                capture_output=True,
+                timeout=30
             )
 
             commit_msg = f"[{agent_name}] {task_desc[:50]}"
@@ -1504,7 +1511,8 @@ class Orchestrator:
                 cwd=str(self.project_root),
                 capture_output=True,
                 text=True,
-                encoding='utf-8'
+                encoding='utf-8',
+                timeout=30
             )
 
             return result.returncode == 0
@@ -1528,7 +1536,8 @@ class Orchestrator:
                 cwd=str(self.project_root),
                 capture_output=True,
                 text=True,
-                encoding='utf-8'
+                encoding='utf-8',
+                timeout=30
             )
 
             if result.returncode == 0:
@@ -1538,7 +1547,8 @@ class Orchestrator:
                     subprocess.run(
                         ["git", "merge", "--abort"],
                         cwd=str(self.project_root),
-                        capture_output=True
+                        capture_output=True,
+                        timeout=30
                     )
                     return False, f"合并冲突: {result.stdout}"
                 return False, result.stderr
@@ -1552,7 +1562,8 @@ class Orchestrator:
             subprocess.run(
                 ["git", "branch", "-d", branch_name],
                 cwd=str(self.project_root),
-                capture_output=True
+                capture_output=True,
+                timeout=30
             )
         except Exception:
             pass
@@ -1959,7 +1970,7 @@ class Orchestrator:
         # 构建提示词（引用 PLAN.md 而非嵌入全文，避免 Windows 命令行长度限制）
         progress_info = ""
         if self.progress_file:
-            progress_info = f"\n📝 完成任务后，请更新进度文件: `{self.progress_file.name}`\n"
+            progress_info = f"\n📝 完成任务后，请将你的工作记录追加到进度文件: `{self.progress_file.name}`（先 Read 保留已有内容，再 Write 追加你的部分）\n"
         task_prompt = f"""请使用 Read 工具读取项目根目录的 `PLAN.md` 文件，然后根据实施计划执行你的职责。
 
 请严格按照计划执行，确保与其他 agents 的工作保持一致。
@@ -1998,8 +2009,8 @@ class Orchestrator:
             }
             all_results = {}
 
-        # 计算起始 phase 索引
-        start_phase_idx = len(all_agents) - len(remaining_agents) + 2
+        # 计算起始 phase 索引（architect 已跳过，从 phase 1 开始）
+        start_phase_idx = len(all_agents) - len(remaining_agents) + 1
 
         # 执行剩余 agents
         for i, agent_name in enumerate(remaining_agents):
@@ -2081,7 +2092,7 @@ class Orchestrator:
         # 构建提示词（引用 PLAN.md 而非嵌入全文，避免 Windows 命令行长度限制）
         progress_info = ""
         if self.progress_file:
-            progress_info = f"\n📝 完成任务后，请更新进度文件: `{self.progress_file.name}`\n"
+            progress_info = f"\n📝 完成任务后，请将你的工作记录追加到进度文件: `{self.progress_file.name}`（先 Read 保留已有内容，再 Write 追加你的部分）\n"
         task_prompt = f"""请使用 Read 工具读取项目根目录的 `PLAN.md` 文件，然后根据实施计划执行你的职责。
 
 请严格按照计划执行，确保与其他 agents 的工作保持一致。
@@ -2340,7 +2351,10 @@ class Orchestrator:
             if not line_stripped:
                 continue
             if any(kw in line_lower for kw in resolved_keywords):
-                continue
+                # "partially resolved" / "not resolved" 等不应跳过
+                partial_qualifiers = ['partial', 'not ', 'un', '未', '部分']
+                if not any(q in line_lower for q in partial_qualifiers):
+                    continue
             if line_stripped.startswith('- [x]') or line_stripped.startswith('* [x]'):
                 continue  # 已勾选的复选框，跳过
 
@@ -2470,7 +2484,7 @@ class Orchestrator:
         # 进度文件后缀（供各阶段 prompt 使用）
         progress_suffix = ""
         if self.progress_file:
-            progress_suffix = f"\n\n📝 完成任务后，请更新进度文件: `{self.progress_file.name}`"
+            progress_suffix = f"\n\n📝 完成任务后，请将你的工作记录追加到进度文件: `{self.progress_file.name}`（先 Read 保留已有内容，再 Write 追加你的部分）"
 
         # 根据复杂度拆分执行阶段
         # phases 格式示例（COMPLEX）: [["architect"], ["tech_lead"], ["developer"], ["tester", "security", "optimizer"]]
@@ -2543,7 +2557,11 @@ class Orchestrator:
             if agent_name == "architect":
                 plan_file = self.project_root / "PLAN.md"
                 if plan_file.exists():
-                    user_request = plan_file.read_text(encoding='utf-8')
+                    try:
+                        user_request = plan_file.read_text(encoding='utf-8', errors='replace')
+                    except (IOError, OSError) as e:
+                        print(f"⚠️ 无法读取 PLAN.md: {e}")
+                        return False
 
         # Phase 2: developer-tester 循环
         current_round = state.get("current_round", 1)
@@ -2963,6 +2981,95 @@ def _open_file_in_editor(file_path: Path) -> None:
             input("编辑完成后按回车继续...")
 
 
+def _get_git_state(project_root: Path) -> tuple:
+    """获取当前 git 状态快照（已修改文件 + 未跟踪文件）"""
+    import subprocess
+    try:
+        r1 = subprocess.run(
+            ["git", "diff", "--name-only"],
+            cwd=str(project_root), capture_output=True, text=True, timeout=10
+        )
+        changed = set(f.strip() for f in r1.stdout.strip().split('\n') if f.strip())
+
+        r2 = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=str(project_root), capture_output=True, text=True, timeout=10
+        )
+        untracked = set(f.strip() for f in r2.stdout.strip().split('\n') if f.strip())
+
+        return changed, untracked
+    except Exception:
+        return set(), set()
+
+
+def _validate_architect_changes(project_root: Path, before_changed: set = None, before_untracked: set = None):
+    """
+    后置校验：检查 architect 是否越权修改了非 .md 文件
+    只回滚 architect 会话期间新增的改动，不影响之前已有的未提交改动
+
+    参数:
+        before_changed: architect 启动前已修改的文件集合
+        before_untracked: architect 启动前已存在的未跟踪文件集合
+    """
+    import subprocess
+
+    if before_changed is None:
+        before_changed = set()
+    if before_untracked is None:
+        before_untracked = set()
+
+    try:
+        after_changed, after_untracked = _get_git_state(project_root)
+
+        # 只关注 architect 期间新增的改动
+        new_changed = after_changed - before_changed
+        new_untracked = after_untracked - before_untracked
+
+        # 过滤出非 .md 文件
+        violated_changed = [f for f in new_changed if not f.lower().endswith('.md')]
+        violated_new = [f for f in new_untracked if not f.lower().endswith('.md')
+                        and not f.startswith('.claude/')]
+
+        if violated_changed or violated_new:
+            print(f"\n{'='*60}")
+            print(f"⚠️  ARCHITECT 后置校验：检测到越权修改！")
+            print(f"{'='*60}")
+
+            if violated_changed:
+                print(f"\n   architect 期间被修改的非 .md 文件:")
+                for f in sorted(violated_changed):
+                    print(f"     ❌ {f}")
+                subprocess.run(
+                    ["git", "checkout", "--"] + list(violated_changed),
+                    cwd=str(project_root), timeout=10
+                )
+                print(f"\n   ✅ 已回滚 {len(violated_changed)} 个被修改的文件")
+
+            if violated_new:
+                print(f"\n   architect 期间新建的非 .md 文件:")
+                for f in sorted(violated_new):
+                    print(f"     ❌ {f}")
+                for f in violated_new:
+                    file_path = project_root / f
+                    if file_path.exists():
+                        file_path.unlink()
+                print(f"\n   ✅ 已删除 {len(violated_new)} 个越权创建的文件")
+
+            print(f"\n{'='*60}\n")
+        else:
+            print(f"\n✅ Architect 后置校验通过：未检测到越权修改")
+
+        # 日志：显示跳过的已有改动（帮助调试）
+        skipped_changed = after_changed & before_changed
+        if skipped_changed:
+            non_md_skipped = [f for f in skipped_changed if not f.lower().endswith('.md')]
+            if non_md_skipped:
+                print(f"   ℹ️  跳过 {len(non_md_skipped)} 个 architect 之前已存在的改动（不回滚）")
+
+    except Exception as e:
+        print(f"\n⚠️ Architect 后置校验异常: {e}")
+
+
 def semi_auto_mode(project_root: Path, config: dict):
     """
     情景2：半自动执行模式
@@ -3002,24 +3109,28 @@ def semi_auto_mode(project_root: Path, config: dict):
 
 **你是 Architect Agent，你的唯一任务是制定计划，而不是实现代码！**
 
-### 🚨 输出文件位置（非常重要！）
+### 🚨 PLAN.md 输出规则（非常重要！）
 
-**所有输出文件必须保存在项目根目录：`{project_root_str}/`**
+**所有输出文件必须保存在项目根目录，使用相对路径。**
 
-- ✅ 正确：使用 Write 工具写入 `PLAN.md`（相对路径，自动保存到项目根目录）
-- ✅ 正确：使用 Write 工具写入 `CODEBASE_ANALYSIS.md`
-- ❌ 错误：不要依赖 Claude CLI 的默认 plan 文件位置
+**PLAN.md 生成规则：**
+1. 先用 Read 工具检查 `PLAN.md` 是否已存在
+2. **如果已存在** → 使用 **Edit 工具更新**（追加或修改相关内容，保留原有计划）
+3. **如果不存在** → 使用 **Write 工具创建** `PLAN.md`
+4. 路径必须是相对路径：`PLAN.md`（不要加任何目录前缀）
 
-**输出文件清单：**
+- ❌ 不要把计划写在对话中，必须写入文件
+- ❌ 不要依赖 Claude CLI 的内置 plan 机制
+
+**其他输出文件：**
 | 文件名 | 位置 | 说明 |
 |--------|------|------|
-| `PLAN.md` | 项目根目录 | 详细实施计划（必须生成） |
 | `CODEBASE_ANALYSIS.md` | 项目根目录 | 代码库分析（现有项目） |
 
 ### 你必须做的事：
 1. 分析用户需求
-2. 如果是现有项目，先探索代码库并**使用 Write 工具**生成 `CODEBASE_ANALYSIS.md`
-3. **使用 Write 工具**生成详细的 `PLAN.md` 实施计划
+2. 如果是现有项目，先探索代码库并生成 `CODEBASE_ANALYSIS.md`
+3. 检查 `PLAN.md` 是否已存在，按上述规则创建或更新
 4. 完成后告知用户输入 `/exit` 退出会话
 
 ### 你绝对不能做的事：
@@ -3043,19 +3154,37 @@ def semi_auto_mode(project_root: Path, config: dict):
     print(f"🚪 生成完毕后输入 /exit 退出，继续执行后续流程", flush=True)
     print(f"{'='*60}\n", flush=True)
 
-    # 进入 claude CLI（plan 模式）
+    # 进入 claude CLI（hooks 提供 architect 权限管控，无需 plan mode）
     cmd = [
         "claude",
-        "--permission-mode", "plan",
+        "--dangerously-skip-permissions",
         "--append-system-prompt", system_prompt,
         "--max-budget-usd", str(config['max_budget']),
     ]
 
     env = os.environ.copy()
     env['ORCHESTRATOR_RUNNING'] = 'true'
+    env['ORCHESTRATOR_AGENT'] = 'architect'  # Hook 用此变量检测 architect 阶段
 
-    # 执行 claude（阻塞，用户交互）
-    process = subprocess.run(cmd, cwd=str(project_root), env=env)
+    # 创建锁文件（Hook 备用检测方式）
+    lock_file = project_root / ".claude" / "architect_active.lock"
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_file.write_text("architect session active", encoding='utf-8')
+
+    # 记录 architect 启动前的 git 状态（用于后置校验的 baseline）
+    before_changed, before_untracked = _get_git_state(project_root)
+    print(f"  📸 [baseline] architect 启动前已有 {len(before_changed)} 个修改文件、{len(before_untracked)} 个未跟踪文件", flush=True)
+
+    try:
+        # 执行 claude（阻塞，用户交互）
+        process = subprocess.run(cmd, cwd=str(project_root), env=env)
+    finally:
+        # 清理锁文件
+        if lock_file.exists():
+            lock_file.unlink()
+
+    # 后置校验：暂时禁用（Hook 已能阻止越权，避免误回滚工作进度）
+    # _validate_architect_changes(project_root, before_changed, before_untracked)
 
     # 检查 PLAN.md 是否生成
     plan_file = project_root / "PLAN.md"
