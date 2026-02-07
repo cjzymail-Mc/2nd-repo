@@ -1,636 +1,142 @@
-# 任务复杂度手动选择功能 - 实施完成
+# orchestrator_v6.py 代码质量审查与测试计划
 
-## 功能概述
-
-在交互菜单中增加"任务复杂度"选择，用户可以手动指定：
-
-- **简单任务 (MINIMAL)**: developer + tester（2个agents，快速执行）
-- **复杂任务 (COMPLEX)**: 全部6个agents（architect → tech_lead → developer → tester → optimizer → security）
-
-**新菜单流程：**
-1. 选择执行模式 (1/2/3/4/5)
-2. 选择迭代轮数 (1/2/3)
-3. **选择任务复杂度 (简单/复杂)** ← 新增
+> **更新日期**: 2026-02-07
+> **目标**: 对 `src/orchestrator_v6.py`（~3900行 多Agent调度系统）进行全面质量审查
+> **执行方式**: Mode 2（从 PLAN.md 继续），建议迭代 2+ 轮
 
 ---
 
-## 已完成的修改
+## 目标文件
 
-### 修改1: 扩展 TaskComplexity 枚举 ✅
-
-**位置:** src/6-agents.py:47-52
-
-**修改内容:**
-```python
-class TaskComplexity(Enum):
-    MINIMAL = "minimal"      # 2个agents (developer + tester) ← 新增
-    SIMPLE = "simple"        # 3个agents (architect → developer → tester)
-    MODERATE = "moderate"    # 4-5个agents
-    COMPLEX = "complex"      # 6个agents (全流程)
-```
-
-### 修改2: 更新 AgentScheduler.plan_execution() ✅
-
-**位置:** src/6-agents.py:224-250
-
-**新增分支:**
-```python
-if complexity == TaskComplexity.MINIMAL:
-    return [
-        ["developer"],
-        ["tester"]
-    ]
-```
-
-### 修改3: 新增 _ask_task_complexity() 函数 ✅
-
-**位置:** src/6-agents.py:~2475（_ask_max_rounds之后）
-
-**功能:**
-- 询问用户选择任务复杂度
-- 返回 TaskComplexity.MINIMAL 或 TaskComplexity.COMPLEX
-
-### 修改4: execute() 支持复杂度覆盖 ✅
-
-**位置:** src/6-agents.py:1202-1235
-
-**新增参数:**
-```python
-async def execute(
-    self,
-    user_request: str,
-    clean_start: bool = True,
-    override_complexity: Optional[TaskComplexity] = None  # 新增
-) -> bool:
-```
-
-**逻辑:**
-- 如果提供 override_complexity，使用用户指定的复杂度
-- 否则，使用 TaskParser 自动解析
-
-### 修改5: execute_with_loop() 支持复杂度覆盖 ✅
-
-**位置:** src/6-agents.py:1842-1880
-
-**同步修改:**
-- 添加 override_complexity 参数
-- 实现与 execute() 相同的复杂度处理逻辑
-
-### 修改6: 更新 interactive_mode() ✅
-
-**位置:** src/6-agents.py:2540-2610
-
-**修改内容:**
-1. 在询问迭代轮数后，调用 `_ask_task_complexity()`
-2. 显示选择结果
-3. 将复杂度传递给 execute/execute_with_loop
-4. 对模式1/2添加提示（复杂度设置会被忽略）
+- **主文件**: `src/orchestrator_v6.py`
+- **单元测试**: `tests/unit/`
+- **不要修改**: `mc-dir-v6.py`、`.claude/` 目录下的所有文件
 
 ---
 
-## 修改文件清单
+## 一、测试方法
 
-| 文件 | 修改内容 | 行数 |
-|------|----------|------|
-| src/6-agents.py | 扩展 TaskComplexity 枚举 | +1 |
-| src/6-agents.py | 更新 plan_execution() | +4 |
-| src/6-agents.py | 新增 _ask_task_complexity() | +14 |
-| src/6-agents.py | 修改 execute() | +8 |
-| src/6-agents.py | 修改 execute_with_loop() | +7 |
-| src/6-agents.py | 更新 interactive_mode() | +20 |
-
-**总计:** ~54行新增/修改
-
----
-
-## 测试结果
-
-### 语法检查 ✅
-```bash
-python -m py_compile src/6-agents.py
-# 通过
-```
-
-### 单元测试 ✅
-```bash
-pytest tests/ -v
-# 61 passed in 1.29s
-```
-
-### 功能验证
-
-#### 测试场景1：简单任务 + MINIMAL
+### 1.1 静态分析（Developer + Tester 共同执行）
 
 ```bash
-python src/6-agents.py
-# 选择：3（全自动模式）
-# 迭代轮数：1
-# 任务复杂度：1（简单任务）
-# 输入："修复 main.py 中的拼写错误"
+# 语法检查
+python -c "import ast; ast.parse(open('src/orchestrator_v6.py', encoding='utf-8').read()); print('OK')"
 
-预期结果：
-✓ 只执行 developer + tester
-✓ 跳过 architect, tech_lead, optimizer, security
-✓ 快速完成
+# 运行现有单元测试
+pytest tests/unit/ -v
+
+# 如果有 ruff/flake8 可用
+ruff check src/orchestrator_v6.py 2>/dev/null || echo "ruff not installed, skip"
 ```
 
-#### 测试场景2：复杂任务 + COMPLEX + 多轮
+### 1.2 代码审查重点区域
 
-```bash
-python src/6-agents.py
-# 选择：3（全自动模式）
-# 迭代轮数：2
-# 任务复杂度：2（复杂任务）
-# 输入："开发一个计算器程序"
+**Developer 和 Tester 必须逐一审查以下模块，发现问题直接修复或报告：**
 
-预期结果：
-✓ 执行全部6个agents
-✓ developer-tester 最多循环2轮
-```
+#### 区域 A: 异常处理一致性
+- **方法**: 搜索所有 `except` 语句，检查是否存在：
+  - `except:` (bare except) — 应改为 `except Exception:`
+  - 缺少异常保护的文件读写操作（对比周围类似代码）
+  - 吞掉异常后无任何日志的 `except: pass`
+- **关注的类/函数**: `TaskParser`、`StateManager`、`AgentRunner`、所有 `read_text()` 调用
 
-#### 测试场景3：半自动模式（提示用户）
+#### 区域 B: subprocess 健壮性
+- **方法**: 搜索所有 `subprocess.run` 调用，检查：
+  - 是否都有 `timeout` 参数（git 操作应有 timeout=30）
+  - 超时后是否正确处理 `subprocess.TimeoutExpired` 异常
+  - 交互式 subprocess（如 `claude` CLI 调用）不应加 timeout
+- **关注的类/函数**: `GitBranchManager` 所有方法、`_get_git_state()`、`_validate_architect_changes()`
 
-```bash
-python src/6-agents.py
-# 选择：1（半自动模式）
-# 迭代轮数：1
-# 任务复杂度：1（简单任务）
+#### 区域 C: 边界条件与防御性编程
+- **方法**: 检查以下场景是否被正确处理：
+  - 空列表/空字符串输入（如 `phases = [[]]`、`plan_content = ""`）
+  - None 值传入字符串操作（如 `task_desc[:50]` 当 task_desc 为 None）
+  - 字典键不存在（`metadata.get()` vs `metadata[]`）
+  - 文件不存在时的 fallback 行为
+- **关注的函数**: `execute()`、`execute_from_plan()`、`execute_from_plan_with_loop()`、`_check_bug_report()`
 
-预期结果：
-⚠️ 显示提示："半自动模式会由 Architect 自动规划，复杂度设置将被忽略"
-✓ 正常进入 Claude CLI
-```
+#### 区域 D: 异步与并行逻辑
+- **方法**: 审查 `asyncio.gather` 相关代码：
+  - 并行 agent 是否共享了不应共享的状态（如同一个 dict）
+  - `gather` 的 `return_exceptions=True` 是否设置
+  - 并行 agent 失败时是否影响其他 agent
+- **关注的函数**: `execute()` Phase 3 并行、`execute_from_plan()` 审查阶段并行
+
+#### 区域 E: 用户输入与配置解析
+- **方法**: 检查菜单输入、YAML frontmatter 解析、命令行参数：
+  - 非法输入是否有友好提示（而非崩溃）
+  - `_parse_agent_file()` 对畸形 YAML 的容错
+  - `_ask_max_rounds()` 对非数字输入的处理
+- **关注的函数**: `main_menu()`、`_parse_agent_file()`、`_ask_max_rounds()`
+
+#### 区域 F: 资源泄漏
+- **方法**: 检查文件句柄、进程是否正确释放：
+  - `open()` 是否都在 `with` 块中
+  - 子进程被 kill 后是否 `await process.wait()`
+  - 临时文件（prompt_xxx.txt）是否在 finally 中清理
+- **关注的函数**: `run_agent()`、`_monitor_architect_stream()`、`_get_next_branch_number()`
 
 ---
 
-## 新菜单示例
+## 二、执行步骤
 
-```
-╔════════════════════════════════════════════════════════════╗
-║       🚀 mc-dir - 多Agent智能调度系统                       ║
-╚════════════════════════════════════════════════════════════╝
+### Developer Agent
 
-选择执行模式：
-  1. 半自动模式（推荐）- 进入 Claude CLI 讨论需求，生成 PLAN.md 后自动执行
-  2. 从 PLAN.md 继续 - 跳过 Architect，直接从现有计划执行（节省 token）
-  3. 全自动模式 - 输入任务后，Architect 自动规划并执行全流程
-  4. （ADV）多agent模式* - 可同时指派多名 Agents🚀🚀🚀
-  5. 退出
+1. 读取 `src/orchestrator_v6.py`
+2. 按照上述区域 A~F 逐一审查
+3. 发现 bug 直接修复（最小改动原则）
+4. 修复后运行 `pytest tests/unit/ -v` 确保不破坏现有测试
+5. 将修复内容记录到 `claude-progress.md`
 
-请选择 [1/2/3/4/5]: 3
+### Tester Agent
 
-开发-测试迭代轮数：
-  1. 1轮（默认）- 线性执行，不循环
-  2. 2轮 - 如有bug，developer-tester再迭代1次
-  3. 3轮 - 最多迭代3次
+1. 运行 `pytest tests/unit/ -v`，记录通过/失败情况
+2. 运行语法检查
+3. 审查 Developer 的改动是否引入新问题
+4. 如发现未修复的 bug，写入 `BUG_REPORT.md`（使用 `- [ ]` 格式）
 
-请选择 [1/2/3，直接回车=1]: 1
-✓ 已设置: 最多 1 轮 developer-tester 迭代
+### Optimizer Agent
 
-任务复杂度：
-  1. 简单任务 - 只用 developer + tester（2个agents，快速执行）
-  2. 复杂任务 - 完整流程（6个agents，全面保障）
+- 检查修复后代码是否有冗余逻辑
+- 检查是否符合 PEP8 风格
+- 不要重构、不要改注释风格、不要添加新功能
 
-请选择 [1/2，直接回车=2]: 1
-✓ 已设置: 简单任务（2个agents）
+### Security Agent
 
-请输入任务描述（或 .md 文件路径）：
-> 修复拼写错误
-
-🚀 全自动模式启动...
-📋 用户需求: 修复拼写错误
-任务复杂度: minimal（用户指定）
-执行计划: 2 个阶段
-
-Phase 1: developer
-Phase 2: tester
-```
+- 检查是否有命令注入风险（subprocess 参数拼接）
+- 检查文件路径操作是否存在路径遍历风险
+- 检查敏感信息是否可能泄漏到日志
 
 ---
 
-## 与现有功能的兼容性
+## 三、约束（所有 Agent 必读）
 
-### 向后兼容 ✅
-- `execute()` 和 `execute_with_loop()` 的 `override_complexity` 参数为**可选**
-- 不传该参数时，保持原有的自动解析行为
-- CLI 参数仍然可用（`--auto-architect`, `--max-rounds` 等）
-
-### 复杂度优先级
-1. **用户手动选择** (override_complexity) → 最高优先级
-2. **自动解析** (TaskParser.parse) → 默认行为
-
-### 特殊模式处理
-- **模式1（半自动）**: 复杂度选择被忽略（architect 规划）
-- **模式2（从PLAN.md继续）**: 复杂度选择被忽略（已有计划）
-- **模式3（全自动）**: 复杂度选择生效
-- **模式4（多agent模式*）**: 不询问复杂度
+- **只改** `src/orchestrator_v6.py`
+- **不要** 修改 `mc-dir-v6.py`（用户手动同步）
+- **不要** 修改 `.claude/` 目录下任何文件（hooks、agents、settings）
+- **不要** 重构、添加新功能、改注释风格
+- **不要** 删除任何现有功能（即使看起来是死代码）
+- **最小改动原则**: 每个修复尽量控制在 1~5 行
 
 ---
 
-## 复杂度对比表
-
-| 复杂度 | Agents数量 | 执行流程 | 适用场景 |
-|--------|-----------|----------|---------|
-| MINIMAL | 2个 | developer → tester | 拼写错误、简单bug修复 |
-| SIMPLE | 3个 | architect → developer → tester | 小功能添加 |
-| MODERATE | 4-5个 | architect → developer → (tester + security) | 中等功能 |
-| COMPLEX | 6个 | architect → tech_lead → developer → (tester + security + optimizer) | 大型功能、系统重构 |
-
----
-
-## 总结
-
-- ✅ 新增 MINIMAL 复杂度选项（2个agents）
-- ✅ 在交互菜单中添加第3个选项：任务复杂度
-- ✅ 支持用户手动覆盖自动解析
-- ✅ 61个单元测试全部通过
-- ✅ 保持向后兼容
-- ✅ 代码质量：语法检查通过
-
-**预计提升：**
-- 简单任务执行速度提升 ~60%（6个agents → 2个agents）
-- Token消耗减少 ~70%
-- 用户控制力增强
-
----
-
-# 2026-02-05 夜间 Bug 修复
-
-## 本次修复的 Bug 列表
-
-| Bug | 描述 | 状态 |
-|-----|------|------|
-| Bug 0 | `execute_with_loop()` 中 branch 命名错误（缺少 first_agent 参数） | ✅ 已修复 |
-| Bug 1 | 半自动模式"批准计划后直接执行"（用户无法编辑 PLAN.md） | ✅ 已修复 |
-| Bug 2 | 多 Agent 并行执行文件冲突（无隔离机制） | ✅ 已修复 |
-
----
-
-## Bug 0: Branch 命名修复
-
-### 问题描述
-
-**位置:** `src/6-agents.py` 第 1890 行（原）
-
-**问题:** `execute_with_loop()` 调用 `_create_feature_branch(user_request)` 时缺少 `first_agent` 参数，导致 MINIMAL 复杂度下 branch 命名错误。
-
-| 复杂度 | 首个 Agent | 修复前 Branch | 修复后 Branch |
-|--------|-----------|--------------|--------------|
-| MINIMAL | developer | feature/arch-XXX ❌ | feature/dev-XXX ✅ |
-| SIMPLE | architect | feature/arch-XXX ✅ | feature/arch-XXX ✅ |
-
-### 修复内容
-
-```python
-# 修复前
-feature_branch = self._create_feature_branch(user_request)
-
-# 修复后
-first_agent = phases[0][0] if phases and phases[0] else "arch"
-feature_branch = self._create_feature_branch(user_request, first_agent)
-```
-
----
-
-## Bug 1: 半自动模式两阶段确认
-
-### 问题描述
-
-**位置:** `src/6-agents.py` `semi_auto_mode()` 函数
-
-**问题:** 用户按 Y 确认后，直接执行后续 agents，无法修改 PLAN.md。
-
-### 修复方案：两阶段确认
-
-**新流程:**
-```
-显示 PLAN.md 预览 → 是否查看/编辑？[Y/n/q]
-  → Y: 打开编辑器 → 显示更新预览
-  → n: 跳过编辑
-  → q: 退出（可用模式2继续）
-→ 确认执行？[Y/n] → 执行
-```
-
-### 新增代码
-
-1. **新增辅助函数** `_open_file_in_editor()` (~第 2255 行)
-   - 跨平台支持（Windows/Linux/Mac）
-   - Windows: `start /wait` 或 notepad
-   - Linux/Mac: `$EDITOR` 或 nano/vim
-
-2. **修改确认逻辑** (~第 2408 行)
-   - 阶段1: 询问是否编辑 PLAN.md（Y/n/q）
-   - 阶段2: 最终执行确认
-
----
-
-## Bug 2: 多 Agent 并行子分支隔离
-
-### 问题描述
-
-**位置:** `src/6-agents.py` 并行执行逻辑
-- `execute()` 第 1485 行（原）
-- `execute_manual()` 第 2325 行（原）
-
-**问题:** 并行 agents 在同一个 feature branch 上工作，可能互相覆盖文件。
-
-### 修复方案：子分支隔离
-
-**新流程:**
-```
-feature/dev-001           ← 主 feature 分支
-├── feature/dev-001-developer-abc123   ← developer 隔离分支
-└── feature/dev-001-optimizer-def456   ← optimizer 隔离分支
-
-执行完成 → 依次合并 → 检测冲突 → 冲突时保留分支供手动处理
-```
-
-### 新增代码
-
-**5 个 Git 辅助方法** (~第 1207 行后):
-
-| 方法 | 功能 |
-|------|------|
-| `_get_current_branch()` | 获取当前分支名 |
-| `_create_agent_subbranch()` | 为 agent 创建隔离子分支 |
-| `_switch_to_branch()` | 切换分支 |
-| `_commit_agent_changes()` | 提交 agent 更改 |
-| `_merge_subbranch()` | 合并子分支（带冲突检测） |
-| `_cleanup_subbranch()` | 清理子分支 |
-
-**修改并行执行逻辑:**
-- `execute()` 和 `execute_manual()` 的 else 分支
-- 为每个并行 agent 创建独立子分支
-- 完成后依次合并，检测冲突
-
----
-
-## 测试结果
-
-### 语法检查 ✅
-```bash
-python -m py_compile src/6-agents.py
-# 通过
-```
-
-### 单元测试 ✅
-```bash
-pytest tests/ -v
-# 61 passed
-```
-
-### 代码改动统计
-```
-src/6-agents.py | +308 行, -12 行
-```
-
----
-
-## 待功能测试
-
-### Bug 1 测试（模式1）
-```bash
-python src/6-agents.py
-# 选择 1 (半自动模式)
-# 生成 PLAN.md 后，测试 Y/n/q 三个选项
-```
-
-### Bug 2 测试（模式4）
-```bash
-python src/6-agents.py
-# 选择 4 (多agent模式)
-# 输入: @developer 修复A && @optimizer 优化B
-# 观察是否创建子分支并正确合并
-```
-
----
-
-## 关键经验
-
-1. **Python 程序可以修改自己** - 代码运行时已在内存中，修改磁盘文件不影响当前执行
-2. **子分支隔离是解决并行冲突的可靠方案** - 比文件锁更灵活，冲突可追溯
-3. **两阶段确认提升用户体验** - 给用户审核/修改的机会，避免直接执行
-
----
-
-# 2026-02-06 四大功能更新 (mission1.md)
-
-## 本次新增功能列表
-
-| Feature | 描述 | 状态 |
-|---------|------|------|
-| Feature 1 | 进度文件管理 + 临时文件自动清理 | ✅ 已完成 |
-| Feature 2 | 优化 01-Agent Repo 扫描（读取现有扫描结果） | ✅ 已完成 |
-| Feature 3 | Hook 机制限制 01-Agent 越权（三重保护） | ✅ 已完成 |
-| Feature 4 | 扩展模式4支持 .md 文件引用 | ✅ 已完成 |
-
----
-
-## Feature 1: 进度文件管理与临时文件处理
-
-### 新增方法
-
-| 方法 | 位置 | 功能 |
-|------|------|------|
-| `_init_progress_file()` | Orchestrator 类 | 创建 claude-progress.md（递增编号避免覆盖） |
-| `_cleanup_temp_agent_files()` | Orchestrator 类 | 清理 CODEBASE_ANALYSIS.md, BUG_REPORT*.md, SECURITY_AUDIT.md, PROGRESS.md |
-
-### 文件命名规则
-
-```
-claude-progress.md      ← 第1次运行
-claude-progress01.md    ← 第2次运行
-claude-progress02.md    ← 第3次运行
-...
-```
-
-### 影响范围
-
-- `Orchestrator.__init__()`: 新增 `self.progress_file` 属性
-- `generate_initial_prompt()`: 新增 `progress_file` 参数，提示 Agent 更新进度文件
-- 所有 `execute*()` 方法（共5个）:
-  - 开头调用 `_init_progress_file()`
-  - 结尾调用 `_cleanup_temp_agent_files()` + 显示进度文件路径
-
-### 临时文件处理策略
-
-| 文件 | 生命周期 |
-|------|---------|
-| `claude-progress*.md` | **永久保留**（用户的持久记录） |
-| `PLAN.md` | **保留**（可能被模式2复用） |
-| `CODEBASE_ANALYSIS.md` | 工作流结束时清理 |
-| `BUG_REPORT.md` / `BUG_REPORT_round*.md` | 工作流结束时清理 |
-| `SECURITY_AUDIT.md` | 工作流结束时清理 |
-| `PROGRESS.md`（agent 生成） | 工作流结束时清理 |
-
----
-
-## Feature 2: 优化 01-Agent Repo 扫描
-
-### 修改位置
-
-`TaskParser.generate_initial_prompt()` — architect + 现有项目分支
-
-### 工作逻辑
-
-```
-if repo-scan-result.md 存在:
-    → 读取内容（截取前3000字符）注入 architect prompt
-    → 跳过"代码库分析"步骤，直接制定 PLAN.md
-else:
-    → 走原流程：architect 全量扫描代码库 → 生成 CODEBASE_ANALYSIS.md → 制定 PLAN.md
-```
-
-### Token 节省预估
-
-- 跳过代码库扫描可节省 architect 阶段约 30-50% 的 token
-- 用户可用外部 LLM（Grok/GPT/Gemini）生成 `repo-scan-result.md`，进一步降低 Claude token 消耗
-
----
-
-## Feature 3: Hook 机制限制 01-Agent 越权
-
-### 问题背景
-
-尽管 architect 已使用 `--permission-mode plan`，特定 prompt（如"对代码进行全面测试和debug"）仍可能导致它直接修改源代码。
-
-### 三重保护机制
-
-**第一层：Prompt 强化（预防）**
-
-- 位置: `AgentExecutor.run_agent()`
-- 当 `config.name == "architect"` 时，自动追加权限限制说明到 `task_prompt`
-- 明确列出允许和禁止的操作，并警告"违反将被回滚"
-
-**第二层：实时流监控（即时拦截）** ← 新增
-
-- 位置: `AgentExecutor._monitor_architect_stream()` + `_check_architect_violation()`
-- 原理: architect 使用 `--output-format stream-json`，逐行读取 stdout 流
-- 检测: 解析每行 JSON，匹配 `Write`/`Edit` 工具调用中的 `file_path` 字段
-- 拦截: 一旦发现目标文件非 `.md`，立即 `process.kill()` 终止进程
-- 返回: `AgentStatus.FAILED`，`exit_code=-2`（越权专用错误码）
-
-| 方法 | 功能 |
-|------|------|
-| `_check_architect_violation(line)` | 解析单行 stream-json，检测是否有对非 .md 文件的 Write/Edit 操作 |
-| `_monitor_architect_stream(process)` | 逐行读取 architect stdout，调用 violation 检查器，发现违规立即 kill |
-
-**优势**: 相比后置校验，实时监控可在 architect 尝试写入第一个非 .md 文件时立即终止，节省后续所有 token 消耗和执行时间。
-
-**第三层：后置校验 + 自动回滚（兜底）**
-
-| 方法 | 功能 |
-|------|------|
-| `_validate_architect_output()` | 执行 `git diff --name-only` + `git ls-files --others`，检测非 .md 文件变更 |
-| `_rollback_architect_violations()` | `git checkout --` 还原已修改文件 + `unlink()` 删除新创建的非 .md 文件 |
-
-> 即使第二层实时监控已拦截进程，第三层仍然执行，确保在 kill 之前已写入的文件被正确回滚。
-
-### 校验触发点
-
-在以下方法中 architect 执行完成后自动调用：
-- `execute()` — 全自动模式
-- `execute_with_loop()` — 多轮循环模式
-- `execute_manual()` — 手动模式（如果手动指定了 @architect）
-
-### 典型拦截流程
-
-```
-Architect 启动 → stream-json 逐行读取
-  ├─ {"type":"tool_use","tool":"Read","file_path":"src/main.py"} → ✅ 允许（Read 不检测）
-  ├─ {"type":"tool_use","tool":"Write","file_path":"PLAN.md"} → ✅ 允许（.md 文件）
-  ├─ {"type":"tool_use","tool":"Edit","file_path":"src/main.py"} → 🚫 违规！
-  │     → process.kill() → 输出警告 → 返回 FAILED (exit_code=-2)
-  └─ 后置校验 → git checkout 回滚 src/main.py
-```
-
----
-
-## Feature 4: 扩展模式4支持 .md 文件引用
-
-### 修改位置
-
-`ManualTaskParser` 类
-
-### 改动内容
-
-1. `__init__()`: 新增 `project_root` 参数（默认 `Path.cwd()`）
-2. `parse()`: 检测任务描述是否以 `.md` 结尾，是则读取文件内容作为任务描述
-3. `interactive_mode()`: `ManualTaskParser()` → `ManualTaskParser(project_root)`
-4. 帮助文本新增 `.md` 文件引用示例
-
-### 使用示例
-
-```
-# 直接描述
-@dev 修复登录页CSS bug
-
-# 从 md 文件读取（新功能）
-@dev task-fix-css.md
-
-# 多 agent + md 文件（并行）
-@dev task1.md && @opti task2.md
-
-# 串行 + md 文件混合
-@arch design.md -> @dev implement.md -> @test test-plan.md
-```
-
-### 错误处理
-
-- 文件不存在: `❌ 文件不存在: task1.md` + 显示完整路径
-- 文件读取失败: `⚠️ 无法读取 task1.md: [错误信息]`
-
----
-
-## 测试结果
-
-### 语法检查 ✅
-```bash
-python -m py_compile src/6-agents.py
-# 通过
-```
-
-### 单元测试 ✅
-```bash
-pytest tests/ -v
-# 61 passed in 1.13s
-```
-
-### 代码改动统计
-```
-src/6-agents.py | +220 行, -15 行
-```
-
----
-
-## 功能测试场景
-
-### Feature 1 测试
-```bash
-python src/6-agents.py
-# 选择模式 3 → 检查 claude-progress.md 是否创建
-# 再次运行 → 检查 claude-progress01.md 是否创建
-# 工作流结束 → 检查 CODEBASE_ANALYSIS.md 等临时文件是否被清理
-```
-
-### Feature 2 测试
-```bash
-# 创建扫描结果文件
-echo "# Repo Scan\n## 结构\nsrc/main.py - 入口" > repo-scan-result.md
-python src/6-agents.py
-# 选择模式 3 → 观察 architect prompt 是否包含"已检测到代码库扫描结果"
-```
-
-### Feature 3 测试
-```bash
-python src/6-agents.py
-# 选择模式 3 → 观察 architect 执行后是否有越权校验日志
-# 如有违规 → 检查是否自动回滚
-```
-
-### Feature 4 测试
-```bash
-python src/6-agents.py
-# 选择模式 4 → 输入: @dev task1.md
-# 检查是否显示 "📄 @developer: 从 task1.md 读取任务描述"
-```
+## 已修复的 Bug（历史记录）
+
+| Bug | 修复版本 | 状态 |
+|-----|---------|------|
+| 分支创建（模式2/3 未创建分支） | fix6.5 | ✅ |
+| 循环终止（BUG_REPORT 格式过严） | fix6.5 | ✅ |
+| 循环保底（第1轮无 BUG_REPORT 提前终止） | fix6.5 | ✅ |
+| 分支命名（MINIMAL 复杂度下分支名错误） | fix6.5 | ✅ |
+| 并行隔离（多 agent 并行无子分支） | fix6.5 | ✅ |
+| PLAN.md 位置（保存到 ~/.claude/plans/） | fix6.5 | ✅ |
+| Hook 输出格式（JSON → exit code 2） | fix6.6 | ✅ |
+| Mode 1 防护缺失（仅2/4层生效） | fix6.6 | ✅ |
+| 线性执行（后3个 agent 串行浪费） | fix6.6 | ✅ |
+| 菜单冗余（Mode 3 全自动鸡肋） | fix6.6 | ✅ |
+| ExitPlanMode 越权执行 → Hook 无条件拦截 | fix6.6 | ✅ |
+| post-validation 误回滚全部工作进度 → baseline 对比（已禁用） | fix6.6 | ✅ |
+| PLAN.md 未生成 → 去掉 plan mode，改 skip-permissions | fix6.6 | ✅ |
+| repo-scan-result.md 只对 architect 加载 → 全 agent 加载 | fix6.6 | ✅ |
+| claude-progress 文件递增堆积 → 固定文件名+每次清理 | fix6.6 | ✅ |
+| run_agent_interactive 缺少 ORCHESTRATOR_AGENT env var | fix6.6 | ✅ |
